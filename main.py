@@ -1,16 +1,15 @@
 import asyncio
 import datetime
 import os
-import random
 import re
-import string
-from urllib.parse import urlparse
+import json
+from urllib.parse import urlparse, parse_qs
 
 import aiohttp
 import aiosqlite
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord.ui import Button, Modal, TextInput, View, button
 
 
@@ -24,6 +23,19 @@ DB_PATH = "clips.db"
 # $0.60 per 1,000 views
 CPM_RATE = 0.60
 
+# How often pending clips are checked
+TRACK_INTERVAL_SECONDS = 300  # 5 minutes
+
+# HTTP timeout
+HTTP_TIMEOUT = 20
+
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+
+
+# ============================================================
+# DISCORD
+# ============================================================
+
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -31,6 +43,80 @@ bot = commands.Bot(
     command_prefix="!",
     intents=intents
 )
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def utc_now():
+    return datetime.datetime.utcnow().isoformat()
+
+
+def calculate_earnings(views):
+    return round((int(views or 0) / 1000) * CPM_RATE, 2)
+
+
+def detect_platform(url):
+    try:
+        host = urlparse(url).netloc.lower()
+
+        if "tiktok.com" in host:
+            return "TikTok"
+
+        if "instagram.com" in host:
+            return "Instagram"
+
+        if "youtube.com" in host or "youtu.be" in host:
+            return "YouTube"
+
+    except Exception:
+        pass
+
+    return "Unknown"
+
+
+def extract_youtube_video_id(url):
+    try:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+
+        if "youtu.be" in host:
+            return parsed.path.strip("/").split("/")[0]
+
+        if "youtube.com" in host:
+            query = parse_qs(parsed.query)
+
+            if query.get("v"):
+                return query["v"][0]
+
+            path_parts = parsed.path.strip("/").split("/")
+
+            if len(path_parts) >= 2:
+                if path_parts[0] in ("shorts", "embed", "live"):
+                    return path_parts[1]
+
+    except Exception:
+        pass
+
+    return None
+
+
+def extract_tiktok_video_id(url):
+    """
+    Attempts to extract a TikTok numeric video ID.
+
+    Examples:
+    https://www.tiktok.com/@user/video/123456789
+    https://www.tiktok.com/@user/video/123456789?...
+    """
+
+    match = re.search(r"/video/(\d+)", url)
+
+    if match:
+        return match.group(1)
+
+    return None
 
 
 # ============================================================
@@ -58,1170 +144,523 @@ async def init_db():
                 status TEXT DEFAULT 'pending',
                 earnings REAL DEFAULT 0,
                 views INTEGER DEFAULT 0,
-                likes INTEGER DEFAULT 0
+                likes INTEGER DEFAULT 0,
+                platform TEXT DEFAULT 'Unknown',
+                last_checked TEXT,
+                stats_error TEXT
             )
         """)
 
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS social_accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                platform TEXT NOT NULL,
-                profile_url TEXT NOT NULL,
-                verification_code TEXT NOT NULL,
-                status TEXT DEFAULT 'pending',
-                added_at TEXT NOT NULL,
-                verified_at TEXT
-            )
-        """)
+        # ----------------------------------------------------
+        # MIGRATION FOR OLD DATABASES
+        # ----------------------------------------------------
 
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS payment_methods (
-                user_id INTEGER PRIMARY KEY,
-                method TEXT,
-                details TEXT,
-                updated_at TEXT
-            )
-        """)
+        async with db.execute("PRAGMA table_info(submissions)") as cursor:
+            columns = await cursor.fetchall()
 
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS payment_transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                amount REAL NOT NULL,
-                method TEXT,
-                details TEXT,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                processed_at TEXT
-            )
-        """)
+        existing_columns = {row[1] for row in columns}
 
-        # Migrate old databases safely.
-        try:
-            await db.execute(
-                "ALTER TABLE submissions ADD COLUMN views INTEGER DEFAULT 0"
-            )
-        except Exception:
-            pass
+        migrations = {
+            "views": "ALTER TABLE submissions ADD COLUMN views INTEGER DEFAULT 0",
+            "likes": "ALTER TABLE submissions ADD COLUMN likes INTEGER DEFAULT 0",
+            "platform": "ALTER TABLE submissions ADD COLUMN platform TEXT DEFAULT 'Unknown'",
+            "last_checked": "ALTER TABLE submissions ADD COLUMN last_checked TEXT",
+            "stats_error": "ALTER TABLE submissions ADD COLUMN stats_error TEXT",
+        }
 
-        try:
-            await db.execute(
-                "ALTER TABLE submissions ADD COLUMN likes INTEGER DEFAULT 0"
-            )
-        except Exception:
-            pass
+        for column, sql in migrations.items():
+            if column not in existing_columns:
+                try:
+                    await db.execute(sql)
+                    print(f"Added database column: {column}")
+                except Exception as e:
+                    print(f"Migration error for {column}: {e}")
 
         await db.commit()
 
-
-def utc_now():
-    return datetime.datetime.now(
-        datetime.timezone.utc
-    ).isoformat()
-
-
-# ============================================================
-# USER DATABASE HELPERS
-# ============================================================
-
-async def ensure_user(user_id: int):
-
-    async with aiosqlite.connect(DB_PATH) as db:
-
-        await db.execute(
-            """
-            INSERT OR IGNORE INTO users
-            (user_id, pending, total_paid)
-            VALUES (?, 0, 0)
-            """,
-            (user_id,)
-        )
-
-        await db.commit()
+    print("Database initialized.")
 
 
 async def get_user(user_id: int):
-
-    await ensure_user(user_id)
-
     async with aiosqlite.connect(DB_PATH) as db:
 
         async with db.execute(
-            """
-            SELECT
-                user_id,
-                linked_account,
-                pending,
-                total_paid
-            FROM users
-            WHERE user_id = ?
-            """,
+            "SELECT * FROM users WHERE user_id = ?",
             (user_id,)
         ) as cursor:
 
             row = await cursor.fetchone()
 
-    return {
-        "user_id": row[0],
-        "linked_account": row[1],
-        "pending": row[2] or 0,
-        "total_paid": row[3] or 0,
-    }
+        if row is None:
 
-
-# ============================================================
-# PAYMENT DATABASE
-# ============================================================
-
-async def get_payment_method(user_id: int):
-
-    async with aiosqlite.connect(DB_PATH) as db:
-
-        async with db.execute(
-            """
-            SELECT method, details
-            FROM payment_methods
-            WHERE user_id = ?
-            """,
-            (user_id,)
-        ) as cursor:
-
-            return await cursor.fetchone()
-
-
-async def create_payment_record(
-    user_id: int,
-    amount: float,
-    status: str
-):
-
-    payment = await get_payment_method(user_id)
-
-    method = payment[0] if payment else None
-    details = payment[1] if payment else None
-
-    async with aiosqlite.connect(DB_PATH) as db:
-
-        await db.execute(
-            """
-            INSERT INTO payment_transactions
-            (
-                user_id,
-                amount,
-                method,
-                details,
-                status,
-                created_at,
-                processed_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                amount,
-                method,
-                details,
-                status,
-                utc_now(),
-                utc_now()
-            )
-        )
-
-        await db.commit()
-
-
-async def get_payment_history(user_id: int):
-
-    async with aiosqlite.connect(DB_PATH) as db:
-
-        async with db.execute(
-            """
-            SELECT
-                id,
-                amount,
-                method,
-                details,
-                status,
-                created_at
-            FROM payment_transactions
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT 10
-            """,
-            (user_id,)
-        ) as cursor:
-
-            return await cursor.fetchall()
-
-
-# ============================================================
-# DASHBOARD DATABASE
-# ============================================================
-
-async def get_dashboard_stats(user_id: int):
-
-    async with aiosqlite.connect(DB_PATH) as db:
-
-        async with db.execute(
-            """
-            SELECT
-                COUNT(*),
-                COALESCE(SUM(likes), 0),
-                COALESCE(
-                    SUM(
-                        CASE
-                            WHEN status = 'approved'
-                            THEN 1
-                            ELSE 0
-                        END
-                    ),
-                    0
-                ),
-                COALESCE(SUM(views), 0),
-                COALESCE(SUM(earnings), 0)
-            FROM submissions
-            WHERE user_id = ?
-            """,
-            (user_id,)
-        ) as cursor:
-
-            row = await cursor.fetchone()
-
-    return {
-        "submissions": row[0] or 0,
-        "likes": row[1] or 0,
-        "approved": row[2] or 0,
-        "views": row[3] or 0,
-        "earnings": row[4] or 0,
-    }
-
-
-async def get_earnings_stats(user_id: int):
-
-    user = await get_user(user_id)
-
-    async with aiosqlite.connect(DB_PATH) as db:
-
-        async with db.execute(
-            """
-            SELECT
-                COALESCE(
-                    SUM(
-                        CASE
-                            WHEN status = 'failed'
-                            THEN amount
-                            ELSE 0
-                        END
-                    ),
-                    0
-                ),
-                COALESCE(
-                    SUM(
-                        CASE
-                            WHEN status = 'rejected'
-                            THEN amount
-                            ELSE 0
-                        END
-                    ),
-                    0
-                )
-            FROM payment_transactions
-            WHERE user_id = ?
-            """,
-            (user_id,)
-        ) as cursor:
-
-            failed, rejected = await cursor.fetchone()
-
-    return {
-        "pending": user["pending"],
-        "paid": user["total_paid"],
-        "failed": failed or 0,
-        "rejected": rejected or 0,
-    }
-
-
-# ============================================================
-# GENERAL HELPERS
-# ============================================================
-
-def calculate_earnings(views: int):
-
-    return (views / 1000) * CPM_RATE
-
-
-def generate_verification_code():
-
-    characters = (
-        string.ascii_uppercase +
-        string.digits
-    )
-
-    return "".join(
-        random.choices(
-            characters,
-            k=10
-        )
-    )
-
-
-def valid_profile_url(url: str):
-
-    try:
-
-        parsed = urlparse(url)
-
-        return (
-            parsed.scheme in ("http", "https")
-            and bool(parsed.netloc)
-        )
-
-    except Exception:
-
-        return False
-
-
-def platform_matches_url(
-    platform: str,
-    url: str
-):
-
-    try:
-
-        host = (
-            urlparse(url)
-            .netloc
-            .lower()
-            .split(":")[0]
-        )
-
-        if platform == "TikTok":
-
-            return (
-                host == "tiktok.com"
-                or host.endswith(".tiktok.com")
+            await db.execute(
+                "INSERT INTO users (user_id) VALUES (?)",
+                (user_id,)
             )
 
-        if platform == "Instagram":
+            await db.commit()
 
-            return (
-                host == "instagram.com"
-                or host.endswith(".instagram.com")
-            )
+            return {
+                "user_id": user_id,
+                "linked_account": None,
+                "pending": 0.0,
+                "total_paid": 0.0
+            }
 
-        if platform == "YouTube":
-
-            return (
-                host == "youtube.com"
-                or host.endswith(".youtube.com")
-                or host == "youtu.be"
-            )
-
-        return False
-
-    except Exception:
-
-        return False
+        return {
+            "user_id": row[0],
+            "linked_account": row[1],
+            "pending": row[2] or 0.0,
+            "total_paid": row[3] or 0.0
+        }
 
 
 # ============================================================
-# SOCIAL VERIFICATION
+# STATS FETCHING
 # ============================================================
 
-async def check_profile_for_code(
-    profile_url: str,
-    code: str
-):
-
+async def fetch_html(session, url):
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 "
-            "(KHTML, like Gecko) "
-            "Version/17.0 Mobile/15E148 "
-            "Safari/604.1"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/139.0.0.0 Safari/537.36"
         ),
-        "Accept-Language": "en-US,en;q=0.9"
+        "Accept": (
+            "text/html,application/xhtml+xml,"
+            "application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
 
-    timeout = aiohttp.ClientTimeout(
-        total=15
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+
+    async with session.get(
+        url,
+        headers=headers,
+        timeout=timeout,
+        allow_redirects=True
+    ) as response:
+
+        if response.status != 200:
+            raise Exception(f"HTTP {response.status}")
+
+        return await response.text(errors="ignore")
+
+
+def find_number_from_text(text, patterns):
+    """
+    Searches HTML/text for common view/like patterns.
+    """
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+            try:
+                value = match.group(1)
+
+                # Remove commas
+                value = value.replace(",", "")
+
+                # Handle simple abbreviations
+                if value.lower().endswith("k"):
+                    return int(float(value[:-1]) * 1000)
+
+                if value.lower().endswith("m"):
+                    return int(float(value[:-1]) * 1000000)
+
+                if value.lower().endswith("b"):
+                    return int(float(value[:-1]) * 1000000000)
+
+                return int(float(value))
+
+            except Exception:
+                continue
+
+    return None
+
+
+# ============================================================
+# YOUTUBE
+# ============================================================
+
+async def fetch_youtube_stats(session, url):
+    video_id = extract_youtube_video_id(url)
+
+    if not video_id:
+        raise Exception("Could not identify YouTube video ID.")
+
+    # --------------------------------------------------------
+    # Official YouTube Data API
+    # --------------------------------------------------------
+
+    if YOUTUBE_API_KEY:
+
+        api_url = (
+            "https://www.googleapis.com/youtube/v3/videos"
+            f"?part=statistics&id={video_id}"
+            f"&key={YOUTUBE_API_KEY}"
+        )
+
+        timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+
+        async with session.get(
+            api_url,
+            timeout=timeout
+        ) as response:
+
+            data = await response.json(content_type=None)
+
+            if response.status != 200:
+                message = data.get("error", {}).get(
+                    "message",
+                    f"HTTP {response.status}"
+                )
+                raise Exception(message)
+
+            items = data.get("items", [])
+
+            if not items:
+                raise Exception("YouTube video was not found.")
+
+            stats = items[0].get("statistics", {})
+
+            views = int(stats.get("viewCount", 0))
+            likes = int(stats.get("likeCount", 0))
+
+            return views, likes
+
+    # --------------------------------------------------------
+    # Fallback page extraction
+    # --------------------------------------------------------
+
+    html = await fetch_html(session, url)
+
+    views = find_number_from_text(
+        html,
+        [
+            r'"viewCount":"(\d+)"',
+            r'"viewCount":(\d+)',
+            r'"views":"([\d,]+)"',
+            r'"viewCountText".*?"simpleText":"([\d,]+)',
+        ]
     )
 
+    likes = find_number_from_text(
+        html,
+        [
+            r'"likeCount":"(\d+)"',
+            r'"likeCount":(\d+)',
+        ]
+    )
+
+    if views is None:
+        raise Exception(
+            "Could not read YouTube views. "
+            "Add YOUTUBE_API_KEY to Railway."
+        )
+
+    return views, likes or 0
+
+
+# ============================================================
+# TIKTOK
+# ============================================================
+
+async def fetch_tiktok_stats(session, url):
+    html = await fetch_html(session, url)
+
+    # TikTok pages often expose values in JSON embedded in HTML.
+    views = find_number_from_text(
+        html,
+        [
+            r'"playCount":(\d+)',
+            r'"playCount":"(\d+)"',
+            r'"viewCount":(\d+)',
+            r'"viewCount":"(\d+)"',
+            r'"play_count":(\d+)',
+            r'"view_count":(\d+)',
+        ]
+    )
+
+    likes = find_number_from_text(
+        html,
+        [
+            r'"diggCount":(\d+)',
+            r'"diggCount":"(\d+)"',
+            r'"likeCount":(\d+)',
+            r'"likeCount":"(\d+)"',
+            r'"like_count":(\d+)',
+            r'"like_count":"(\d+)"',
+        ]
+    )
+
+    if views is None:
+        raise Exception(
+            "TikTok did not expose the video statistics to the bot."
+        )
+
+    return views, likes or 0
+
+
+# ============================================================
+# INSTAGRAM
+# ============================================================
+
+async def fetch_instagram_stats(session, url):
+    html = await fetch_html(session, url)
+
+    # Instagram can expose public media information inside
+    # embedded JSON depending on the page/account.
+    views = find_number_from_text(
+        html,
+        [
+            r'"video_view_count":(\d+)',
+            r'"video_view_count":"(\d+)"',
+            r'"play_count":(\d+)',
+            r'"play_count":"(\d+)"',
+            r'"view_count":(\d+)',
+            r'"view_count":"(\d+)"',
+            r'"video_play_count":(\d+)',
+            r'"video_play_count":"(\d+)"',
+        ]
+    )
+
+    likes = find_number_from_text(
+        html,
+        [
+            r'"like_count":(\d+)',
+            r'"like_count":"(\d+)"',
+            r'"likes":\{"count":(\d+)',
+            r'"edge_media_preview_like".*?"count":(\d+)',
+        ]
+    )
+
+    # Instagram photos/reels may not expose a separate view count.
+    # For video content, if views aren't available but likes are,
+    # keep views unavailable rather than falsely treating likes as views.
+
+    if views is None:
+        raise Exception(
+            "Instagram did not expose the video statistics to the bot."
+        )
+
+    return views, likes or 0
+
+
+# ============================================================
+# UNIVERSAL STATS FETCHER
+# ============================================================
+
+async def fetch_clip_stats(url):
+    platform = detect_platform(url)
+
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+
+    connector = aiohttp.TCPConnector(
+        limit=10,
+        ssl=False
+    )
+
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        connector=connector
+    ) as session:
+
+        if platform == "YouTube":
+            views, likes = await fetch_youtube_stats(
+                session,
+                url
+            )
+
+        elif platform == "TikTok":
+            views, likes = await fetch_tiktok_stats(
+                session,
+                url
+            )
+
+        elif platform == "Instagram":
+            views, likes = await fetch_instagram_stats(
+                session,
+                url
+            )
+
+        else:
+            raise Exception(
+                "Only TikTok, Instagram and YouTube links are supported."
+            )
+
+        return {
+            "platform": platform,
+            "views": int(views),
+            "likes": int(likes),
+            "earnings": calculate_earnings(views)
+        }
+
+
+# ============================================================
+# UPDATE ONE SUBMISSION
+# ============================================================
+
+async def update_submission_stats(submission_id, url):
     try:
 
-        async with aiohttp.ClientSession(
-            timeout=timeout,
-            headers=headers
-        ) as session:
+        stats = await fetch_clip_stats(url)
 
-            async with session.get(
-                profile_url,
-                allow_redirects=True
-            ) as response:
+        async with aiosqlite.connect(DB_PATH) as db:
 
-                if response.status != 200:
-                    return False
-
-                html = await response.text(
-                    errors="ignore"
+            await db.execute(
+                """
+                UPDATE submissions
+                SET views = ?,
+                    likes = ?,
+                    platform = ?,
+                    earnings = ?,
+                    last_checked = ?,
+                    stats_error = NULL
+                WHERE id = ?
+                """,
+                (
+                    stats["views"],
+                    stats["likes"],
+                    stats["platform"],
+                    stats["earnings"],
+                    utc_now(),
+                    submission_id
                 )
+            )
 
-                return (
-                    code.lower()
-                    in html.lower()
-                )
+            await db.commit()
+
+        print(
+            f"[STATS] Submission #{submission_id}: "
+            f"{stats['platform']} | "
+            f"{stats['views']} views | "
+            f"{stats['likes']} likes | "
+            f"${stats['earnings']:.2f}"
+        )
+
+        return stats
 
     except Exception as e:
 
+        error = str(e)[:500]
+
+        async with aiosqlite.connect(DB_PATH) as db:
+
+            await db.execute(
+                """
+                UPDATE submissions
+                SET last_checked = ?,
+                    stats_error = ?
+                WHERE id = ?
+                """,
+                (
+                    utc_now(),
+                    error,
+                    submission_id
+                )
+            )
+
+            await db.commit()
+
         print(
-            f"Verification error: {e}"
+            f"[STATS ERROR] Submission #{submission_id}: {error}"
         )
 
-        return False
+        return None
 
 
 # ============================================================
-# ACCOUNT LINK MODAL
+# BACKGROUND TRACKER
 # ============================================================
 
-class ProfileURLModal(Modal):
+@tasks.loop(seconds=TRACK_INTERVAL_SECONDS)
+async def track_pending_clips():
 
-    def __init__(self, platform):
+    try:
 
-        super().__init__(
-            title=f"Link {platform}"
-        )
-
-        self.platform = platform
-
-        self.profile_url = TextInput(
-            label=f"{platform} Profile URL",
-            placeholder="https://...",
-            required=True,
-            max_length=500
-        )
-
-        self.add_item(
-            self.profile_url
-        )
-
-    async def on_submit(
-        self,
-        interaction: discord.Interaction
-    ):
-
-        url = (
-            self.profile_url
-            .value
-            .strip()
-        )
-
-        if not valid_profile_url(url):
-
-            return await interaction.response.send_message(
-                "❌ Please enter a valid profile URL.",
-                ephemeral=True
-            )
-
-        if not platform_matches_url(
-            self.platform,
-            url
-        ):
-
-            return await interaction.response.send_message(
-                f"❌ That doesn't appear to be a valid "
-                f"**{self.platform}** profile URL.",
-                ephemeral=True
-            )
-
-        code = generate_verification_code()
-
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
+        async with aiosqlite.connect(DB_PATH) as db:
 
             async with db.execute(
                 """
-                SELECT id
-                FROM social_accounts
-                WHERE user_id = ?
-                AND profile_url = ?
-                """,
-                (
-                    interaction.user.id,
-                    url
-                )
+                SELECT id, clip_url
+                FROM submissions
+                WHERE status = 'pending'
+                ORDER BY id ASC
+                LIMIT 50
+                """
             ) as cursor:
 
-                existing = await cursor.fetchone()
-
-            if existing:
-
-                return await interaction.response.send_message(
-                    "❌ You already have this account added.",
-                    ephemeral=True
-                )
-
-            await db.execute(
-                """
-                INSERT INTO social_accounts
-                (
-                    user_id,
-                    platform,
-                    profile_url,
-                    verification_code,
-                    status,
-                    added_at
-                )
-                VALUES (?, ?, ?, ?, 'pending', ?)
-                """,
-                (
-                    interaction.user.id,
-                    self.platform,
-                    url,
-                    code,
-                    utc_now()
-                )
-            )
-
-            await db.commit()
-
-        await interaction.response.send_message(
-            f"### 🔐 {self.platform} Verification\n\n"
-            f"Your verification code is:\n"
-            f"**`{code}`**\n\n"
-            f"**Step 1:** Put this exact code in your "
-            f"**{self.platform} bio/about section**.\n\n"
-            f"**Step 2:** Keep it visible.\n\n"
-            f"**Step 3:** Come back and click "
-            f"**Check Verification**.\n\n"
-            f"⚠️ Your account will not be linked until "
-            f"the code is found.",
-            ephemeral=True
-        )
-
-
-# ============================================================
-# ACCOUNT VIEW
-# ============================================================
-
-class AccountView(View):
-
-    def __init__(self):
-
-        super().__init__(
-            timeout=180
-        )
-
-    @button(
-        label="TikTok",
-        style=discord.ButtonStyle.secondary,
-        emoji="🎵",
-        row=0
-    )
-    async def tiktok(
-        self,
-        interaction,
-        button
-    ):
-
-        await interaction.response.send_modal(
-            ProfileURLModal("TikTok")
-        )
-
-    @button(
-        label="Instagram",
-        style=discord.ButtonStyle.secondary,
-        emoji="📸",
-        row=0
-    )
-    async def instagram(
-        self,
-        interaction,
-        button
-    ):
-
-        await interaction.response.send_modal(
-            ProfileURLModal("Instagram")
-        )
-
-    @button(
-        label="YouTube",
-        style=discord.ButtonStyle.secondary,
-        emoji="▶️",
-        row=0
-    )
-    async def youtube(
-        self,
-        interaction,
-        button
-    ):
-
-        await interaction.response.send_modal(
-            ProfileURLModal("YouTube")
-        )
-
-    @button(
-        label="Check Verification",
-        style=discord.ButtonStyle.success,
-        emoji="🔎",
-        row=1
-    )
-    async def check_verification(
-        self,
-        interaction,
-        button
-    ):
-
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
-
-            async with db.execute(
-                """
-                SELECT
-                    id,
-                    platform,
-                    profile_url,
-                    verification_code
-                FROM social_accounts
-                WHERE user_id = ?
-                AND status = 'pending'
-                ORDER BY id DESC
-                """,
-                (interaction.user.id,)
-            ) as cursor:
-
-                accounts = await cursor.fetchall()
-
-        if not accounts:
-
-            return await interaction.response.send_message(
-                "You don't have any accounts waiting for verification.",
-                ephemeral=True
-            )
-
-        await interaction.response.defer(
-            ephemeral=True
-        )
-
-        verified = []
-
-        for (
-            account_id,
-            platform,
-            profile_url,
-            code
-        ) in accounts:
-
-            found = await check_profile_for_code(
-                profile_url,
-                code
-            )
-
-            if found:
-
-                async with aiosqlite.connect(
-                    DB_PATH
-                ) as db:
-
-                    await db.execute(
-                        """
-                        UPDATE social_accounts
-                        SET
-                            status = 'verified',
-                            verified_at = ?
-                        WHERE id = ?
-                        """,
-                        (
-                            utc_now(),
-                            account_id
-                        )
-                    )
-
-                    await db.commit()
-
-                verified.append(
-                    platform
-                )
-
-        if verified:
-
-            return await interaction.followup.send(
-                f"✅ Successfully verified: "
-                f"**{', '.join(verified)}**",
-                ephemeral=True
-            )
-
-        await interaction.followup.send(
-            "❌ I couldn't find the verification code yet.\n\n"
-            "Make sure:\n"
-            "• The code is exact\n"
-            "• It is publicly visible\n"
-            "• The profile URL is correct\n"
-            "• The account is publicly accessible\n\n"
-            "Then try again.",
-            ephemeral=True
-        )
-
-    @button(
-        label="Remove Account",
-        style=discord.ButtonStyle.danger,
-        emoji="🗑️",
-        row=1
-    )
-    async def remove_account(
-        self,
-        interaction,
-        button
-    ):
-
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
-
-            async with db.execute(
-                """
-                SELECT
-                    id,
-                    platform,
-                    status
-                FROM social_accounts
-                WHERE user_id = ?
-                ORDER BY id DESC
-                """,
-                (interaction.user.id,)
-            ) as cursor:
-
-                accounts = await cursor.fetchall()
-
-        if not accounts:
-
-            return await interaction.response.send_message(
-                "You don't have any social accounts.",
-                ephemeral=True
-            )
-
-        view = View(
-            timeout=120
-        )
-
-        for (
-            account_id,
-            platform,
-            status
-        ) in accounts:
-
-            account_button = Button(
-                label=f"{platform} ({status})",
-                style=discord.ButtonStyle.danger
-            )
-
-            async def callback(
-                interaction,
-                account_id=account_id,
-                platform=platform
-            ):
-
-                async with aiosqlite.connect(
-                    DB_PATH
-                ) as db:
-
-                    await db.execute(
-                        """
-                        DELETE FROM social_accounts
-                        WHERE id = ?
-                        AND user_id = ?
-                        """,
-                        (
-                            account_id,
-                            interaction.user.id
-                        )
-                    )
-
-                    await db.commit()
-
-                await interaction.response.send_message(
-                    f"🗑️ **{platform}** account removed.",
-                    ephemeral=True
-                )
-
-            account_button.callback = callback
-
-            view.add_item(
-                account_button
-            )
-
-        await interaction.response.send_message(
-            "Select the account you want to remove:",
-            view=view,
-            ephemeral=True
-        )
-
-
-# ============================================================
-# PAYMENT MODAL
-# ============================================================
-
-class PaymentModal(Modal):
-
-    def __init__(self, method):
-
-        super().__init__(
-            title=f"{method} Payment"
-        )
-
-        self.method = method
-
-        placeholders = {
-            "Apple Pay":
-                "Email or Apple Pay contact",
-
-            "PayPal":
-                "PayPal email",
-
-            "Zelle":
-                "Zelle email or phone",
-
-            "Venmo":
-                "Venmo username"
-        }
-
-        self.details = TextInput(
-            label=f"{method} Details",
-            placeholder=placeholders[method],
-            required=True,
-            max_length=200
-        )
-
-        self.add_item(
-            self.details
-        )
-
-    async def on_submit(
-        self,
-        interaction
-    ):
-
-        details = (
-            self.details
-            .value
-            .strip()
-        )
-
-        if not details:
-
-            return await interaction.response.send_message(
-                "❌ Payment details cannot be empty.",
-                ephemeral=True
-            )
-
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
-
-            await db.execute(
-                """
-                INSERT INTO payment_methods
-                (
-                    user_id,
-                    method,
-                    details,
-                    updated_at
-                )
-                VALUES (?, ?, ?, ?)
-
-                ON CONFLICT(user_id)
-                DO UPDATE SET
-                    method =
-                        excluded.method,
-                    details =
-                        excluded.details,
-                    updated_at =
-                        excluded.updated_at
-                """,
-                (
-                    interaction.user.id,
-                    self.method,
-                    details,
-                    utc_now()
-                )
-            )
-
-            await db.commit()
-
-        await interaction.response.send_message(
-            f"✅ **Payment method saved.**\n\n"
-            f"**Method:** {self.method}\n"
-            f"**Details:** `{details}`",
-            ephemeral=True
-        )
-
-
-# ============================================================
-# PAYMENT VIEW
-# ============================================================
-
-class PaymentView(View):
-
-    def __init__(self):
-
-        super().__init__(
-            timeout=180
-        )
-
-    # FIXED:
-    #  is not a valid Discord emoji.
-    # 🍎 is a valid Unicode emoji.
-    @button(
-        label="Apple Pay",
-        style=discord.ButtonStyle.secondary,
-        emoji="🍎",
-        row=0
-    )
-    async def apple_pay(
-        self,
-        interaction,
-        button
-    ):
-
-        await interaction.response.send_modal(
-            PaymentModal("Apple Pay")
-        )
-
-    @button(
-        label="PayPal",
-        style=discord.ButtonStyle.secondary,
-        emoji="💙",
-        row=0
-    )
-    async def paypal(
-        self,
-        interaction,
-        button
-    ):
-
-        await interaction.response.send_modal(
-            PaymentModal("PayPal")
-        )
-
-    @button(
-        label="Zelle",
-        style=discord.ButtonStyle.secondary,
-        emoji="💜",
-        row=1
-    )
-    async def zelle(
-        self,
-        interaction,
-        button
-    ):
-
-        await interaction.response.send_modal(
-            PaymentModal("Zelle")
-        )
-
-    @button(
-        label="Venmo",
-        style=discord.ButtonStyle.secondary,
-        emoji="💰",
-        row=1
-    )
-    async def venmo(
-        self,
-        interaction,
-        button
-    ):
-
-        await interaction.response.send_modal(
-            PaymentModal("Venmo")
-        )
-
-
-# ============================================================
-# DASHBOARD VIEW
-# ============================================================
-
-class DashboardView(View):
-
-    def __init__(self):
-
-        super().__init__(
-            timeout=180
-        )
-
-    @button(
-        label="Refresh",
-        style=discord.ButtonStyle.secondary,
-        emoji="🔄"
-    )
-    async def refresh(
-        self,
-        interaction,
-        button
-    ):
-
-        stats = await get_dashboard_stats(
-            interaction.user.id
-        )
-
-        embed = discord.Embed(
-            title="📊 Dashboard",
-            color=0x2B2D31
-        )
-
-        embed.add_field(
-            name="📤 Total Submissions",
-            value=f"**{stats['submissions']:,}**",
-            inline=True
-        )
-
-        embed.add_field(
-            name="❤️ Total Likes",
-            value=f"**{stats['likes']:,}**",
-            inline=True
-        )
-
-        embed.add_field(
-            name="✅ Approved Clips",
-            value=f"**{stats['approved']:,}**",
-            inline=True
-        )
-
-        embed.add_field(
-            name="👁️ Total Views",
-            value=f"**{stats['views']:,}**",
-            inline=True
-        )
-
-        embed.add_field(
-            name="💰 Total Earnings",
-            value=f"**${stats['earnings']:.2f}**",
-            inline=True
-        )
-
-        embed.add_field(
-            name="💵 Rate",
-            value=f"**${CPM_RATE:.2f}/1K views**",
-            inline=True
-        )
-
-        await interaction.response.edit_message(
-            embed=embed,
-            view=self
-        )
-
-
-# ============================================================
-# EARNINGS VIEW
-# ============================================================
-
-class EarningsView(View):
-
-    def __init__(self):
-
-        super().__init__(
-            timeout=180
-        )
-
-    @button(
-        label="Payment History",
-        style=discord.ButtonStyle.secondary,
-        emoji="📜"
-    )
-    async def payment_history(
-        self,
-        interaction,
-        button
-    ):
-
-        rows = await get_payment_history(
-            interaction.user.id
-        )
+                rows = await cursor.fetchall()
 
         if not rows:
+            return
 
-            return await interaction.response.send_message(
-                "No payment history yet.",
-                ephemeral=True
-            )
-
-        text = "**Payment History**\n\n"
-
-        for (
-            payment_id,
-            amount,
-            method,
-            details,
-            status,
-            created_at
-        ) in rows:
-
-            text += (
-                f"**#{payment_id}**\n"
-                f"💰 Amount: **${amount:.2f}**\n"
-                f"💳 Method: **{method or 'N/A'}**\n"
-                f"📌 Status: **{status}**\n"
-                f"🕐 {created_at[:19].replace('T', ' ')} UTC\n\n"
-            )
-
-        await interaction.response.send_message(
-            text[:1900],
-            ephemeral=True
+        print(
+            f"[TRACKER] Checking {len(rows)} pending clip(s)..."
         )
+
+        for submission_id, clip_url in rows:
+
+            await update_submission_stats(
+                submission_id,
+                clip_url
+            )
+
+            # Small delay to avoid hammering platforms
+            await asyncio.sleep(2)
+
+    except Exception as e:
+        print(f"[TRACKER ERROR] {e}")
+
+
+@track_pending_clips.before_loop
+async def before_track_pending_clips():
+
+    await bot.wait_until_ready()
 
 
 # ============================================================
-# USER CLIP PANEL
+# USER PANEL
 # ============================================================
 
 class ClipPanel(View):
 
     def __init__(self):
+        super().__init__(timeout=None)
 
-        super().__init__(
-            timeout=None
-        )
+    # --------------------------------------------------------
+    # SUBMIT VIDEO
+    # --------------------------------------------------------
 
     @button(
         label="Submit Video",
         style=discord.ButtonStyle.primary,
         emoji="📩",
-        custom_id="clips_submit",
+        custom_id="submit_video",
         row=0
     )
     async def submit_video(
         self,
-        interaction,
-        button
+        interaction: discord.Interaction,
+        button: Button
     ):
 
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
+        user = await get_user(interaction.user.id)
 
-            async with db.execute(
-                """
-                SELECT id
-                FROM social_accounts
-                WHERE user_id = ?
-                AND status = 'verified'
-                LIMIT 1
-                """,
-                (interaction.user.id,)
-            ) as cursor:
-
-                verified = await cursor.fetchone()
-
-        if not verified:
+        if not user["linked_account"]:
 
             return await interaction.response.send_message(
-                "❌ You must have at least one "
-                "**verified TikTok, Instagram, or YouTube account** "
-                "before submitting a clip.\n\n"
-                "Click **Accounts** to link one.",
+                "❌ You must link an account first! "
+                "Click the **Accounts** button.",
                 ephemeral=True
             )
 
@@ -1234,19 +673,16 @@ class ClipPanel(View):
         def check(message):
 
             return (
-                message.author.id ==
-                interaction.user.id
-                and
-                message.channel.id ==
-                interaction.channel.id
+                message.author.id == interaction.user.id
+                and message.channel.id == interaction.channel.id
             )
 
         try:
 
-            message = await bot.wait_for(
+            msg = await bot.wait_for(
                 "message",
                 check=check,
-                timeout=60
+                timeout=60.0
             )
 
         except asyncio.TimeoutError:
@@ -1256,10 +692,7 @@ class ClipPanel(View):
                 ephemeral=True
             )
 
-        clip_url = (
-            message.content
-            .strip()
-        )
+        clip_url = msg.content.strip()
 
         if not re.match(
             r"^https?://",
@@ -1272,11 +705,23 @@ class ClipPanel(View):
                 ephemeral=True
             )
 
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
+        platform = detect_platform(clip_url)
 
-            await db.execute(
+        if platform == "Unknown":
+
+            return await interaction.followup.send(
+                "❌ Please submit a TikTok, Instagram, "
+                "or YouTube link.",
+                ephemeral=True
+            )
+
+        # ----------------------------------------------------
+        # INSERT FIRST
+        # ----------------------------------------------------
+
+        async with aiosqlite.connect(DB_PATH) as db:
+
+            cursor = await db.execute(
                 """
                 INSERT INTO submissions
                 (
@@ -1286,232 +731,165 @@ class ClipPanel(View):
                     status,
                     earnings,
                     views,
-                    likes
+                    likes,
+                    platform,
+                    last_checked,
+                    stats_error
                 )
-                VALUES (?, ?, ?, 'pending', 0, 0, 0)
+                VALUES (?, ?, ?, 'pending', 0, 0, 0, ?, NULL, NULL)
                 """,
                 (
                     interaction.user.id,
                     clip_url,
-                    utc_now()
+                    utc_now(),
+                    platform
+                )
+            )
+
+            submission_id = cursor.lastrowid
+
+            await db.commit()
+
+        # ----------------------------------------------------
+        # IMMEDIATELY FETCH STATS
+        # ----------------------------------------------------
+
+        stats = await update_submission_stats(
+            submission_id,
+            clip_url
+        )
+
+        if stats:
+
+            await interaction.followup.send(
+                (
+                    f"✅ **Clip submitted successfully!**\n\n"
+                    f"🆔 Submission: **#{submission_id}**\n"
+                    f"📱 Platform: **{stats['platform']}**\n"
+                    f"👁️ Views: **{stats['views']:,}**\n"
+                    f"❤️ Likes: **{stats['likes']:,}**\n"
+                    f"💰 Estimated earnings: "
+                    f"**${stats['earnings']:.2f}**\n\n"
+                    f"⏳ Your clip is now being tracked."
+                ),
+                ephemeral=True
+            )
+
+        else:
+
+            await interaction.followup.send(
+                (
+                    f"✅ **Clip submitted successfully!**\n\n"
+                    f"🆔 Submission: **#{submission_id}**\n"
+                    f"📱 Platform: **{platform}**\n\n"
+                    f"⚠️ I could not read the current views/likes yet.\n"
+                    f"I will try again automatically while the "
+                    f"clip is pending."
+                ),
+                ephemeral=True
+            )
+
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # ACCOUNTS
+    # --------------------------------------------------------
+
+    @button(
+        label="Accounts",
+        style=discord.ButtonStyle.secondary,
+        emoji="🪪",
+        custom_id="accounts",
+        row=0
+    )
+    async def accounts(
+        self,
+        interaction: discord.Interaction,
+        button: Button
+    ):
+
+        user = await get_user(interaction.user.id)
+
+        if user["linked_account"]:
+
+            return await interaction.response.send_message(
+                (
+                    f"✅ Currently linked: "
+                    f"**{user['linked_account']}**\n\n"
+                    f"Reply with a new one to change it."
+                ),
+                ephemeral=True
+            )
+
+        await interaction.response.send_message(
+            "Reply with your account "
+            "(example: `TikTok @username`):",
+            ephemeral=True
+        )
+
+        def check(message):
+
+            return (
+                message.author.id == interaction.user.id
+                and message.channel.id == interaction.channel.id
+            )
+
+        try:
+
+            msg = await bot.wait_for(
+                "message",
+                check=check,
+                timeout=60.0
+            )
+
+        except asyncio.TimeoutError:
+
+            return await interaction.followup.send(
+                "⏰ Timed out.",
+                ephemeral=True
+            )
+
+        account = msg.content.strip()
+
+        async with aiosqlite.connect(DB_PATH) as db:
+
+            await db.execute(
+                """
+                UPDATE users
+                SET linked_account = ?
+                WHERE user_id = ?
+                """,
+                (
+                    account,
+                    interaction.user.id
                 )
             )
 
             await db.commit()
 
         await interaction.followup.send(
-            "✅ Clip submitted successfully!",
+            f"✅ Account linked: **{account}**",
             ephemeral=True
         )
 
-        try:
-
-            await message.delete()
-
-        except Exception:
-
-            pass
-
-    @button(
-        label="Accounts",
-        style=discord.ButtonStyle.secondary,
-        emoji="🪪",
-        custom_id="clips_accounts",
-        row=0
-    )
-    async def accounts(
-        self,
-        interaction,
-        button
-    ):
-
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
-
-            async with db.execute(
-                """
-                SELECT
-                    platform,
-                    profile_url,
-                    status
-                FROM social_accounts
-                WHERE user_id = ?
-                ORDER BY id DESC
-                """,
-                (interaction.user.id,)
-            ) as cursor:
-
-                accounts = await cursor.fetchall()
-
-        text = "**Your Social Accounts**\n\n"
-
-        if accounts:
-
-            for (
-                platform,
-                profile_url,
-                status
-            ) in accounts:
-
-                icon = {
-                    "TikTok": "🎵",
-                    "Instagram": "📸",
-                    "YouTube": "▶️"
-                }.get(
-                    platform,
-                    "🔗"
-                )
-
-                text += (
-                    f"{icon} **{platform}** — "
-                    f"`{status}`\n"
-                    f"{profile_url}\n\n"
-                )
-
-        else:
-
-            text += (
-                "You don't have any accounts yet.\n\n"
-            )
-
-        text += (
-            "Choose a platform below to add an account."
-        )
-
-        await interaction.response.send_message(
-            text,
-            view=AccountView(),
-            ephemeral=True
-        )
-
-    @button(
-        label="Dashboard",
-        style=discord.ButtonStyle.secondary,
-        emoji="📊",
-        custom_id="clips_dashboard",
-        row=1
-    )
-    async def dashboard(
-        self,
-        interaction,
-        button
-    ):
-
-        stats = await get_dashboard_stats(
-            interaction.user.id
-        )
-
-        embed = discord.Embed(
-            title="📊 Dashboard",
-            color=0x2B2D31
-        )
-
-        embed.add_field(
-            name="📤 Total Submissions",
-            value=f"**{stats['submissions']:,}**",
-            inline=True
-        )
-
-        embed.add_field(
-            name="❤️ Total Likes",
-            value=f"**{stats['likes']:,}**",
-            inline=True
-        )
-
-        embed.add_field(
-            name="✅ Approved Clips",
-            value=f"**{stats['approved']:,}**",
-            inline=True
-        )
-
-        embed.add_field(
-            name="👁️ Total Views",
-            value=f"**{stats['views']:,}**",
-            inline=True
-        )
-
-        embed.add_field(
-            name="💰 Total Earnings",
-            value=f"**${stats['earnings']:.2f}**",
-            inline=True
-        )
-
-        embed.add_field(
-            name="💵 Rate",
-            value=f"**${CPM_RATE:.2f}/1K views**",
-            inline=True
-        )
-
-        await interaction.response.send_message(
-            embed=embed,
-            view=DashboardView(),
-            ephemeral=True
-        )
-
-    @button(
-        label="Earnings",
-        style=discord.ButtonStyle.secondary,
-        emoji="💰",
-        custom_id="clips_earnings",
-        row=1
-    )
-    async def earnings(
-        self,
-        interaction,
-        button
-    ):
-
-        stats = await get_earnings_stats(
-            interaction.user.id
-        )
-
-        embed = discord.Embed(
-            title="💰 Earnings",
-            color=0x2B2D31
-        )
-
-        embed.add_field(
-            name="⏳ Pending",
-            value=f"**${stats['pending']:.2f}**",
-            inline=True
-        )
-
-        embed.add_field(
-            name="✅ Paid",
-            value=f"**${stats['paid']:.2f}**",
-            inline=True
-        )
-
-        embed.add_field(
-            name="⚠️ Failed",
-            value=f"**${stats['failed']:.2f}**",
-            inline=True
-        )
-
-        embed.add_field(
-            name="❌ Rejected",
-            value=f"**${stats['rejected']:.2f}**",
-            inline=True
-        )
-
-        await interaction.response.send_message(
-            embed=embed,
-            view=EarningsView(),
-            ephemeral=True
-        )
+    # --------------------------------------------------------
+    # SAY HI
+    # --------------------------------------------------------
 
     @button(
         label="Say Hi",
         style=discord.ButtonStyle.secondary,
         emoji="👋",
-        custom_id="clips_hi",
-        row=2
+        custom_id="say_hi",
+        row=1
     )
     async def say_hi(
         self,
-        interaction,
-        button
+        interaction: discord.Interaction,
+        button: Button
     ):
 
         await interaction.response.send_message(
@@ -1519,32 +897,90 @@ class ClipPanel(View):
             ephemeral=True
         )
 
+    # --------------------------------------------------------
+    # CHECK EARNINGS
+    # --------------------------------------------------------
+
+    @button(
+        label="Check Earnings",
+        style=discord.ButtonStyle.secondary,
+        emoji="📊",
+        custom_id="check_earnings",
+        row=1
+    )
+    async def check_earnings(
+        self,
+        interaction: discord.Interaction,
+        button: Button
+    ):
+
+        user = await get_user(interaction.user.id)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+
+            async with db.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(views), 0),
+                    COALESCE(SUM(likes), 0),
+                    COALESCE(SUM(earnings), 0)
+                FROM submissions
+                WHERE user_id = ?
+                AND status = 'approved'
+                """,
+                (interaction.user.id,)
+            ) as cursor:
+
+                row = await cursor.fetchone()
+
+        approved_clips = row[0]
+        views = row[1]
+        likes = row[2]
+        earnings = row[3]
+
+        await interaction.response.send_message(
+            (
+                f"**Your Earnings**\n\n"
+                f"💰 Pending: **${user['pending']:.2f}**\n"
+                f"✅ Total Paid: **${user['total_paid']:.2f}**\n"
+                f"📋 Approved Clips: **{approved_clips}**\n"
+                f"👁️ Approved Views: **{views:,}**\n"
+                f"❤️ Approved Likes: **{likes:,}**\n"
+                f"📈 Approved Earnings: **${earnings:.2f}**"
+            ),
+            ephemeral=True
+        )
+
+    # --------------------------------------------------------
+    # SUBMISSION HISTORY
+    # --------------------------------------------------------
+
     @button(
         label="Submission History",
         style=discord.ButtonStyle.secondary,
         emoji="📋",
-        custom_id="clips_history",
+        custom_id="submission_history",
         row=2
     )
     async def submission_history(
         self,
-        interaction,
-        button
+        interaction: discord.Interaction,
+        button: Button
     ):
 
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
+        async with aiosqlite.connect(DB_PATH) as db:
 
             async with db.execute(
                 """
                 SELECT
                     id,
                     clip_url,
+                    platform,
                     status,
-                    earnings,
                     views,
-                    likes
+                    likes,
+                    earnings
                 FROM submissions
                 WHERE user_id = ?
                 ORDER BY id DESC
@@ -1562,24 +998,25 @@ class ClipPanel(View):
                 ephemeral=True
             )
 
-        text = "**Your Recent Submissions**\n\n"
+        text = "**Your last submissions:**\n\n"
 
         for (
-            submission_id,
+            sub_id,
             url,
+            platform,
             status,
-            earnings,
             views,
-            likes
+            likes,
+            earnings
         ) in rows:
 
             text += (
-                f"**Submission #{submission_id}**\n"
-                f"📌 Status: **{status}**\n"
-                f"👁️ Views: **{views:,}**\n"
-                f"❤️ Likes: **{likes:,}**\n"
-                f"💰 Earnings: **${earnings:.2f}**\n"
-                f"🔗 `{url[:50]}`\n\n"
+                f"**#{sub_id} — {platform}**\n"
+                f"👁️ {views:,} views | "
+                f"❤️ {likes:,} likes\n"
+                f"Status: **{status}** | "
+                f"${earnings:.2f}\n"
+                f"[Open Clip]({url})\n\n"
             )
 
         await interaction.response.send_message(
@@ -1587,74 +1024,170 @@ class ClipPanel(View):
             ephemeral=True
         )
 
+    # --------------------------------------------------------
+    # PAYMENT
+    # --------------------------------------------------------
+
     @button(
         label="Payment",
         style=discord.ButtonStyle.secondary,
         emoji="💳",
-        custom_id="clips_payment",
+        custom_id="payment",
         row=2
     )
     async def payment(
         self,
-        interaction,
-        button
+        interaction: discord.Interaction,
+        button: Button
     ):
 
-        payment = await get_payment_method(
-            interaction.user.id
-        )
-
-        if payment:
-
-            method, details = payment
-
-            current = (
-                "**Current Payment Method**\n"
-                f"💳 **{method}**\n"
-                f"📌 `{details}`\n\n"
-            )
-
-        else:
-
-            current = (
-                "**No payment method saved yet.**\n\n"
-            )
-
         await interaction.response.send_message(
-            current +
-            "Choose your preferred payment method:",
-            view=PaymentView(),
+            "Reply with your payment details "
+            "(example: `PayPal email@example.com`):",
             ephemeral=True
         )
 
 
 # ============================================================
-# ADMIN VIEW
+# APPROVE MODAL
+# ============================================================
+
+class ApproveModal(Modal, title="Approve Clip"):
+
+    def __init__(
+        self,
+        submission_id: int,
+        user_id: int
+    ):
+
+        super().__init__()
+
+        self.submission_id = submission_id
+        self.user_id = user_id
+
+        self.confirm = TextInput(
+            label="Type APPROVE to confirm",
+            placeholder="APPROVE",
+            required=True,
+            max_length=20
+        )
+
+        self.add_item(self.confirm)
+
+    async def on_submit(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        if self.confirm.value.strip().upper() != "APPROVE":
+
+            return await interaction.response.send_message(
+                "❌ Approval cancelled.",
+                ephemeral=True
+            )
+
+        async with aiosqlite.connect(DB_PATH) as db:
+
+            async with db.execute(
+                """
+                SELECT
+                    user_id,
+                    views,
+                    likes,
+                    earnings,
+                    clip_url,
+                    platform
+                FROM submissions
+                WHERE id = ?
+                AND status = 'pending'
+                """,
+                (self.submission_id,)
+            ) as cursor:
+
+                row = await cursor.fetchone()
+
+            if not row:
+
+                return await interaction.response.send_message(
+                    "❌ Submission not found or already handled.",
+                    ephemeral=True
+                )
+
+            user_id = row[0]
+            views = row[1] or 0
+            likes = row[2] or 0
+            clip_url = row[4]
+            platform = row[5]
+
+            # Recalculate from latest stored views.
+            amount = calculate_earnings(views)
+
+            await db.execute(
+                """
+                UPDATE submissions
+                SET status = 'approved',
+                    earnings = ?
+                WHERE id = ?
+                """,
+                (
+                    amount,
+                    self.submission_id
+                )
+            )
+
+            await db.execute(
+                """
+                UPDATE users
+                SET pending = pending + ?
+                WHERE user_id = ?
+                """,
+                (
+                    amount,
+                    user_id
+                )
+            )
+
+            await db.commit()
+
+        await interaction.response.send_message(
+            (
+                f"✅ **Clip Approved!**\n\n"
+                f"🆔 Submission: **#{self.submission_id}**\n"
+                f"📱 Platform: **{platform}**\n"
+                f"👁️ Views: **{views:,}**\n"
+                f"❤️ Likes: **{likes:,}**\n"
+                f"💰 Added: **${amount:.2f}**\n"
+                f"👤 User: <@{user_id}>"
+            ),
+            ephemeral=True
+        )
+
+
+# ============================================================
+# ADMIN PANEL
 # ============================================================
 
 class AdminView(View):
 
     def __init__(self):
+        super().__init__(timeout=120)
 
-        super().__init__(
-            timeout=None
-        )
+    # --------------------------------------------------------
+    # VIEW PENDING
+    # --------------------------------------------------------
 
     @button(
         label="View Pending Clips",
         style=discord.ButtonStyle.primary,
-        emoji="📥",
-        custom_id="admin_pending"
+        emoji="📥"
     )
     async def view_pending(
         self,
-        interaction,
-        button
+        interaction: discord.Interaction,
+        button: Button
     ):
 
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
+        async with aiosqlite.connect(DB_PATH) as db:
 
             async with db.execute(
                 """
@@ -1662,7 +1195,13 @@ class AdminView(View):
                     id,
                     user_id,
                     clip_url,
-                    submitted_at
+                    submitted_at,
+                    platform,
+                    views,
+                    likes,
+                    earnings,
+                    last_checked,
+                    stats_error
                 FROM submissions
                 WHERE status = 'pending'
                 ORDER BY id DESC
@@ -1681,25 +1220,53 @@ class AdminView(View):
 
         embed = discord.Embed(
             title="📥 Pending Clips",
+            description=(
+                f"Tracking rate: **${CPM_RATE:.2f} / 1,000 views**\n"
+                f"Stats refresh approximately every "
+                f"**{TRACK_INTERVAL_SECONDS // 60} minutes**."
+            ),
             color=discord.Color.orange()
         )
 
-        for (
-            submission_id,
-            user_id,
-            clip_url,
-            submitted_at
-        ) in rows:
+        for row in rows:
+
+            (
+                sub_id,
+                user_id,
+                url,
+                submitted_at,
+                platform,
+                views,
+                likes,
+                earnings,
+                last_checked,
+                stats_error
+            ) = row
+
+            value = (
+                f"**Platform:** {platform}\n"
+                f"👁️ **Views:** {views:,}\n"
+                f"❤️ **Likes:** {likes:,}\n"
+                f"💰 **Estimated:** ${earnings:.2f}\n"
+                f"[Open Clip]({url})\n"
+                f"Submitted: {submitted_at[:16].replace('T', ' ')}"
+            )
+
+            if last_checked:
+                value += (
+                    f"\nLast checked: "
+                    f"{last_checked[:16].replace('T', ' ')}"
+                )
+
+            if stats_error:
+                value += (
+                    f"\n⚠️ Stats issue: "
+                    f"`{stats_error[:150]}`"
+                )
 
             embed.add_field(
-                name=f"Submission #{submission_id}",
-                value=(
-                    f"👤 User ID: `{user_id}`\n"
-                    f"👤 User: <@{user_id}>\n"
-                    f"🔗 [Open Clip]({clip_url})\n"
-                    f"🕐 Submitted: "
-                    f"{submitted_at[:16]}"
-                ),
+                name=f"🆔 #{sub_id} | <@{user_id}>",
+                value=value,
                 inline=False
             )
 
@@ -1708,68 +1275,60 @@ class AdminView(View):
             ephemeral=True
         )
 
+    # --------------------------------------------------------
+    # APPROVE
+    # --------------------------------------------------------
+
     @button(
         label="Approve Clip",
         style=discord.ButtonStyle.success,
-        emoji="✅",
-        custom_id="admin_approve"
+        emoji="✅"
     )
     async def approve_clip(
         self,
-        interaction,
-        button
+        interaction: discord.Interaction,
+        button: Button
     ):
 
         await interaction.response.send_message(
-            "Type the **Submission ID** you want to approve.",
+            "Please type the **Submission ID** you want to approve:",
             ephemeral=True
         )
 
         def check(message):
 
             return (
-                message.author.id ==
-                interaction.user.id
-                and
-                message.channel.id ==
-                interaction.channel.id
+                message.author.id == interaction.user.id
+                and message.channel.id == interaction.channel.id
             )
 
         try:
 
-            message = await bot.wait_for(
+            msg = await bot.wait_for(
                 "message",
                 check=check,
-                timeout=30
+                timeout=30.0
             )
 
-            submission_id = int(
-                message.content.strip()
-            )
+            sub_id = int(msg.content.strip())
 
-        except (
-            asyncio.TimeoutError,
-            ValueError
-        ):
+        except Exception:
 
             return await interaction.followup.send(
-                "❌ Invalid Submission ID or timed out.",
+                "❌ Invalid ID or timed out.",
                 ephemeral=True
             )
 
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
+        async with aiosqlite.connect(DB_PATH) as db:
 
             async with db.execute(
                 """
-                SELECT
-                    user_id,
-                    status
+                SELECT user_id
                 FROM submissions
                 WHERE id = ?
+                AND status = 'pending'
                 """,
-                (submission_id,)
+                (sub_id,)
             ) as cursor:
 
                 row = await cursor.fetchone()
@@ -1777,307 +1336,165 @@ class AdminView(View):
         if not row:
 
             return await interaction.followup.send(
-                "❌ Submission not found.",
+                "❌ Submission not found or already handled.",
                 ephemeral=True
             )
 
-        if row[1] != "pending":
-
-            return await interaction.followup.send(
-                "❌ This submission has already been handled.",
-                ephemeral=True
-            )
-
-        await interaction.followup.send(
-            f"Submission **#{submission_id}** found.\n\n"
-            f"Type the **views and likes** separated by a space.\n"
-            f"Example: `87000 4200`",
-            ephemeral=True
+        modal = ApproveModal(
+            sub_id,
+            row[0]
         )
 
-        try:
+        await interaction.response.send_modal(modal)
 
-            stats_message = await bot.wait_for(
-                "message",
-                check=check,
-                timeout=60
-            )
-
-            parts = (
-                stats_message
-                .content
-                .replace(",", "")
-                .split()
-            )
-
-            if len(parts) != 2:
-                raise ValueError
-
-            views = int(parts[0])
-            likes = int(parts[1])
-
-            if views < 0 or likes < 0:
-                raise ValueError
-
-        except (
-            asyncio.TimeoutError,
-            ValueError
-        ):
-
-            return await interaction.followup.send(
-                "❌ Invalid views/likes or timed out.",
-                ephemeral=True
-            )
-
-        earnings = calculate_earnings(
-            views
-        )
-
-        user_id = row[0]
-
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
-
-            await db.execute(
-                """
-                UPDATE submissions
-                SET
-                    status = 'approved',
-                    views = ?,
-                    likes = ?,
-                    earnings = ?
-                WHERE id = ?
-                AND status = 'pending'
-                """,
-                (
-                    views,
-                    likes,
-                    earnings,
-                    submission_id
-                )
-            )
-
-            await db.execute(
-                """
-                INSERT OR IGNORE INTO users
-                (user_id)
-                VALUES (?)
-                """,
-                (user_id,)
-            )
-
-            await db.execute(
-                """
-                UPDATE users
-                SET pending = pending + ?
-                WHERE user_id = ?
-                """,
-                (
-                    earnings,
-                    user_id
-                )
-            )
-
-            await db.commit()
-
-        await interaction.followup.send(
-            f"✅ **Submission #{submission_id} approved!**\n\n"
-            f"👤 User ID: `{user_id}`\n"
-            f"👁️ Views: **{views:,}**\n"
-            f"❤️ Likes: **{likes:,}**\n"
-            f"💰 Added: **${earnings:.2f}**",
-            ephemeral=True
-        )
-
-        try:
-
-            await message.delete()
-            await stats_message.delete()
-
-        except Exception:
-
-            pass
+    # --------------------------------------------------------
+    # REJECT
+    # --------------------------------------------------------
 
     @button(
         label="Reject Clip",
         style=discord.ButtonStyle.danger,
-        emoji="❌",
-        custom_id="admin_reject"
+        emoji="❌"
     )
     async def reject_clip(
         self,
-        interaction,
-        button
+        interaction: discord.Interaction,
+        button: Button
     ):
 
         await interaction.response.send_message(
-            "Type the **Submission ID** to reject.",
+            "Type the **Submission ID** to reject:",
             ephemeral=True
         )
 
         def check(message):
 
             return (
-                message.author.id ==
-                interaction.user.id
-                and
-                message.channel.id ==
-                interaction.channel.id
+                message.author.id == interaction.user.id
+                and message.channel.id == interaction.channel.id
             )
 
         try:
 
-            message = await bot.wait_for(
+            msg = await bot.wait_for(
                 "message",
                 check=check,
-                timeout=30
+                timeout=30.0
             )
 
-            submission_id = int(
-                message.content.strip()
-            )
+            sub_id = int(msg.content.strip())
 
-        except (
-            asyncio.TimeoutError,
-            ValueError
-        ):
+        except Exception:
 
             return await interaction.followup.send(
                 "❌ Invalid ID or timed out.",
                 ephemeral=True
             )
 
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
+        async with aiosqlite.connect(DB_PATH) as db:
 
-            async with db.execute(
-                """
-                SELECT status
-                FROM submissions
-                WHERE id = ?
-                """,
-                (submission_id,)
-            ) as cursor:
-
-                row = await cursor.fetchone()
-
-            if not row:
-
-                return await interaction.followup.send(
-                    "❌ Submission not found.",
-                    ephemeral=True
-                )
-
-            if row[0] != "pending":
-
-                return await interaction.followup.send(
-                    "❌ Submission already handled.",
-                    ephemeral=True
-                )
-
-            await db.execute(
+            cursor = await db.execute(
                 """
                 UPDATE submissions
                 SET status = 'rejected'
                 WHERE id = ?
+                AND status = 'pending'
                 """,
-                (submission_id,)
+                (sub_id,)
             )
 
             await db.commit()
 
+            if cursor.rowcount == 0:
+
+                return await interaction.followup.send(
+                    "❌ Submission not found or already handled.",
+                    ephemeral=True
+                )
+
         await interaction.followup.send(
-            f"❌ Submission **#{submission_id}** rejected.",
+            f"✅ Submission `{sub_id}` has been rejected.",
             ephemeral=True
         )
 
-        try:
-
-            await message.delete()
-
-        except Exception:
-
-            pass
+    # --------------------------------------------------------
+    # MARK PAID
+    # --------------------------------------------------------
 
     @button(
-        label="Mark Paid",
+        label="Mark as Paid",
         style=discord.ButtonStyle.secondary,
-        emoji="💸",
-        custom_id="admin_paid"
+        emoji="💸"
     )
     async def mark_paid(
         self,
-        interaction,
-        button
+        interaction: discord.Interaction,
+        button: Button
     ):
 
         await interaction.response.send_message(
-            "Type the **User ID** whose pending balance "
-            "you want to mark as paid.",
+            (
+                "Type the **User ID** "
+                "(or mention) to mark their pending "
+                "balance as paid:"
+            ),
             ephemeral=True
         )
 
         def check(message):
 
             return (
-                message.author.id ==
-                interaction.user.id
-                and
-                message.channel.id ==
-                interaction.channel.id
+                message.author.id == interaction.user.id
+                and message.channel.id == interaction.channel.id
             )
 
         try:
 
-            message = await bot.wait_for(
+            msg = await bot.wait_for(
                 "message",
                 check=check,
-                timeout=30
+                timeout=30.0
             )
 
-            user_id = int(
-                message.content.strip()
-            )
+            content = msg.content.strip()
 
-        except (
-            asyncio.TimeoutError,
-            ValueError
-        ):
+            if content.startswith("<@"):
+
+                user_id = int(
+                    content
+                    .replace("<@", "")
+                    .replace("!", "")
+                    .replace(">", "")
+                )
+
+            else:
+
+                user_id = int(content)
+
+        except Exception:
 
             return await interaction.followup.send(
-                "❌ Invalid User ID or timed out.",
+                "❌ Invalid user.",
                 ephemeral=True
             )
 
-        user = await get_user(
-            user_id
-        )
+        user = await get_user(user_id)
 
         if user["pending"] <= 0:
 
             return await interaction.followup.send(
-                "❌ This user has no pending balance.",
+                "This user has no pending balance.",
                 ephemeral=True
             )
 
         amount = user["pending"]
 
-        payment = await get_payment_method(
-            user_id
-        )
-
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
+        async with aiosqlite.connect(DB_PATH) as db:
 
             await db.execute(
                 """
                 UPDATE users
-                SET
-                    total_paid =
-                        total_paid + pending,
+                SET total_paid = total_paid + pending,
                     pending = 0
                 WHERE user_id = ?
                 """,
@@ -2086,234 +1503,13 @@ class AdminView(View):
 
             await db.commit()
 
-        await create_payment_record(
-            user_id,
-            amount,
-            "paid"
-        )
-
-        if payment:
-
-            payment_text = (
-                f"💳 **{payment[0]}**\n"
-                f"📌 `{payment[1]}`"
-            )
-
-        else:
-
-            payment_text = (
-                "⚠️ No payment method saved."
-            )
-
         await interaction.followup.send(
-            f"✅ **Payment marked as paid.**\n\n"
-            f"👤 User ID: `{user_id}`\n"
-            f"💰 Amount: **${amount:.2f}**\n\n"
-            f"**Payment Information**\n"
-            f"{payment_text}",
+            (
+                f"✅ Marked **${amount:.2f}** as paid "
+                f"for <@{user_id}>."
+            ),
             ephemeral=True
         )
-
-        try:
-
-            await message.delete()
-
-        except Exception:
-
-            pass
-
-    @button(
-        label="Payment Failed",
-        style=discord.ButtonStyle.danger,
-        emoji="⚠️",
-        custom_id="admin_payment_failed"
-    )
-    async def payment_failed(
-        self,
-        interaction,
-        button
-    ):
-
-        await self.payment_status_flow(
-            interaction,
-            "failed"
-        )
-
-    @button(
-        label="Payment Rejected",
-        style=discord.ButtonStyle.danger,
-        emoji="🚫",
-        custom_id="admin_payment_rejected"
-    )
-    async def payment_rejected(
-        self,
-        interaction,
-        button
-    ):
-
-        await self.payment_status_flow(
-            interaction,
-            "rejected"
-        )
-
-    async def payment_status_flow(
-        self,
-        interaction,
-        status
-    ):
-
-        await interaction.response.send_message(
-            f"Type the **User ID** whose pending payment "
-            f"should be marked **{status}**.",
-            ephemeral=True
-        )
-
-        def check(message):
-
-            return (
-                message.author.id ==
-                interaction.user.id
-                and
-                message.channel.id ==
-                interaction.channel.id
-            )
-
-        try:
-
-            message = await bot.wait_for(
-                "message",
-                check=check,
-                timeout=30
-            )
-
-            user_id = int(
-                message.content.strip()
-            )
-
-        except (
-            asyncio.TimeoutError,
-            ValueError
-        ):
-
-            return await interaction.followup.send(
-                "❌ Invalid User ID or timed out.",
-                ephemeral=True
-            )
-
-        user = await get_user(
-            user_id
-        )
-
-        if user["pending"] <= 0:
-
-            return await interaction.followup.send(
-                "❌ This user has no pending balance.",
-                ephemeral=True
-            )
-
-        amount = user["pending"]
-
-        # IMPORTANT:
-        # Failed/rejected does not erase pending balance.
-        await create_payment_record(
-            user_id,
-            amount,
-            status
-        )
-
-        await interaction.followup.send(
-            f"{'⚠️' if status == 'failed' else '🚫'} "
-            f"Payment marked as **{status}**.\n\n"
-            f"👤 User ID: `{user_id}`\n"
-            f"💰 Amount: **${amount:.2f}**\n\n"
-            f"The user's pending balance remains available.",
-            ephemeral=True
-        )
-
-        try:
-
-            await message.delete()
-
-        except Exception:
-
-            pass
-
-    @button(
-        label="View User Payment",
-        style=discord.ButtonStyle.secondary,
-        emoji="💳",
-        custom_id="admin_view_payment"
-    )
-    async def view_user_payment(
-        self,
-        interaction,
-        button
-    ):
-
-        await interaction.response.send_message(
-            "Type the **User ID** whose payment information "
-            "you want to view.",
-            ephemeral=True
-        )
-
-        def check(message):
-
-            return (
-                message.author.id ==
-                interaction.user.id
-                and
-                message.channel.id ==
-                interaction.channel.id
-            )
-
-        try:
-
-            message = await bot.wait_for(
-                "message",
-                check=check,
-                timeout=30
-            )
-
-            user_id = int(
-                message.content.strip()
-            )
-
-        except (
-            asyncio.TimeoutError,
-            ValueError
-        ):
-
-            return await interaction.followup.send(
-                "❌ Invalid User ID or timed out.",
-                ephemeral=True
-            )
-
-        payment = await get_payment_method(
-            user_id
-        )
-
-        if not payment:
-
-            return await interaction.followup.send(
-                f"❌ User `{user_id}` has no payment method saved.",
-                ephemeral=True
-            )
-
-        await interaction.followup.send(
-            f"**Payment Information**\n\n"
-            f"👤 User ID: `{user_id}`\n"
-            f"💳 Method: **{payment[0]}**\n"
-            f"📌 Details: `{payment[1]}`",
-            ephemeral=True
-        )
-
-        try:
-
-            await message.delete()
-
-        except Exception:
-
-            pass
 
 
 # ============================================================
@@ -2335,15 +1531,13 @@ async def setup_clips(
         title="why Bebe ??? 😻💦",
         description=(
             "**INSTRUCTIONS**\n\n"
-            "1. Link and verify at least one social account.\n"
-            "2. Submit your clip using the button below.\n"
-            "3. Clips older than 12 hours will not be accepted.\n\n"
-            "**💰 PAYOUT RATE**\n"
-            "$0.60 per 1K views\n\n"
-            "25K = $15\n"
-            "50K = $30\n"
-            "100K = $60\n"
-            "1M = $600"
+            "Please link an account before submitting clips. "
+            "Use the buttons below to manage your account, "
+            "submit clips, check earnings, view submission "
+            "history, and manage payments.\n\n"
+            "**Clips older than 12 hours will not be accepted.**\n\n"
+            f"💰 Rate: **${CPM_RATE:.2f} per 1,000 views**\n"
+            "📊 Views and likes are checked automatically."
         ),
         color=0x2B2D31
     )
@@ -2369,7 +1563,8 @@ async def admin_panel(
         title="🛠️ Admin Panel",
         description=(
             "Manage clip submissions and payments.\n\n"
-            f"**Payout:** ${CPM_RATE:.2f} per 1K views"
+            "Pending clips are automatically checked for "
+            "updated views and likes."
         ),
         color=discord.Color.dark_grey()
     )
@@ -2382,80 +1577,28 @@ async def admin_panel(
 
 
 # ============================================================
-# COMMAND ERROR HANDLER
-# ============================================================
-
-@bot.tree.error
-async def on_app_command_error(
-    interaction,
-    error
-):
-
-    print(
-        f"Command error: {repr(error)}"
-    )
-
-    if isinstance(
-        error,
-        app_commands.MissingPermissions
-    ):
-
-        message = (
-            "❌ You need administrator permission "
-            "to use this command."
-        )
-
-    else:
-
-        message = (
-            "❌ Something went wrong "
-            "while running that command."
-        )
-
-    try:
-
-        if interaction.response.is_done():
-
-            await interaction.followup.send(
-                message,
-                ephemeral=True
-            )
-
-        else:
-
-            await interaction.response.send_message(
-                message,
-                ephemeral=True
-            )
-
-    except Exception as e:
-
-        print(
-            f"Could not send error message: {e}"
-        )
-
-
-# ============================================================
 # READY
 # ============================================================
 
 @bot.event
 async def on_ready():
 
-    print(
-        f"Logged in as {bot.user}"
-    )
+    print("=" * 50)
+    print(f"Logged in as {bot.user}")
+    print("=" * 50)
 
     await init_db()
 
-    # Persistent views.
-    bot.add_view(
-        ClipPanel()
-    )
+    # Persistent public panel
+    bot.add_view(ClipPanel())
 
-    bot.add_view(
-        AdminView()
-    )
+    # Start tracker only once
+    if not track_pending_clips.is_running():
+        track_pending_clips.start()
+        print(
+            f"Pending clip tracker started. "
+            f"Interval: {TRACK_INTERVAL_SECONDS}s"
+        )
 
     try:
 
@@ -2481,5 +1624,6 @@ if not TOKEN:
     raise RuntimeError(
         "TOKEN environment variable is missing."
     )
+
 
 bot.run(TOKEN)
