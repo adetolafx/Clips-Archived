@@ -13,6 +13,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from discord.ui import Button, Modal, TextInput, View, button
 
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -30,8 +31,9 @@ CPM_RATE = 0.60
 # Check pending clips every 5 minutes.
 TRACKER_INTERVAL = 300
 
-# User-facing temporary error messages.
-ERROR_DELETE_DELAY = 3
+# User-facing result/error messages disappear automatically.
+RESULT_DELETE_DELAY = 1
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -41,17 +43,24 @@ bot = commands.Bot(
     intents=intents
 )
 
+
 # ============================================================
-# TEMPORARY ERROR HELPER
+# TEMPORARY RESULT / ERROR HELPER
 # ============================================================
 
-async def send_temporary_error(
+async def send_temporary_message(
     interaction: discord.Interaction,
-    content: str,
-    delay: int = ERROR_DELETE_DELAY
+    content: str = None,
+    *,
+    embed=None,
+    delay: float = RESULT_DELETE_DELAY
 ):
     """
-    Send an ephemeral error message and remove it automatically.
+    Send an ephemeral result/error message and automatically
+    delete it shortly afterward.
+
+    This is intended for temporary interaction feedback.
+    It must NOT be used for permanent panels.
     """
 
     try:
@@ -60,6 +69,7 @@ async def send_temporary_error(
 
             message = await interaction.followup.send(
                 content,
+                embed=embed,
                 ephemeral=True,
                 wait=True
             )
@@ -75,6 +85,7 @@ async def send_temporary_error(
 
             await interaction.response.send_message(
                 content,
+                embed=embed,
                 ephemeral=True
             )
 
@@ -88,8 +99,22 @@ async def send_temporary_error(
     except Exception as e:
 
         print(
-            f"[TEMP ERROR] Could not send/delete error: {e}"
+            f"[TEMP MESSAGE] Could not send/delete message: {e}"
         )
+
+
+async def send_temporary_error(
+    interaction: discord.Interaction,
+    content: str,
+    delay: float = RESULT_DELETE_DELAY
+):
+
+    await send_temporary_message(
+        interaction,
+        content,
+        delay=delay
+    )
+
 
 # ============================================================
 # DATABASE
@@ -162,23 +187,29 @@ async def init_db():
         # --------------------------------------------------------
 
         try:
+
             await db.execute(
                 "ALTER TABLE submissions ADD COLUMN views INTEGER DEFAULT 0"
             )
+
         except Exception:
             pass
 
         try:
+
             await db.execute(
                 "ALTER TABLE submissions ADD COLUMN likes INTEGER DEFAULT 0"
             )
+
         except Exception:
             pass
 
         try:
+
             await db.execute(
                 "ALTER TABLE submissions ADD COLUMN payout_status TEXT DEFAULT 'unpaid'"
             )
+
         except Exception:
             pass
 
@@ -200,6 +231,7 @@ def utc_now():
     return datetime.datetime.now(
         datetime.timezone.utc
     ).isoformat()
+
 
 # ============================================================
 # USER DATABASE HELPERS
@@ -248,6 +280,7 @@ async def get_user(user_id: int):
         "pending": row[2] or 0,
         "total_paid": row[3] or 0,
     }
+
 
 # ============================================================
 # PAYMENT DATABASE
@@ -332,6 +365,7 @@ async def get_payment_history(user_id: int):
         ) as cursor:
 
             return await cursor.fetchall()
+
 
 # ============================================================
 # DASHBOARD DATABASE
@@ -428,6 +462,7 @@ async def get_earnings_stats(user_id: int):
         "rejected": rejected or 0,
     }
 
+
 # ============================================================
 # PAYOUT DATABASE
 # ============================================================
@@ -510,6 +545,7 @@ async def get_user_all_submissions(user_id: int):
         ) as cursor:
 
             return await cursor.fetchall()
+
 
 # ============================================================
 # GENERAL HELPERS
@@ -629,6 +665,7 @@ def detect_platform_from_url(url: str):
 
     return None
 
+
 # ============================================================
 # VIDEO ID HELPERS
 # ============================================================
@@ -681,6 +718,7 @@ def extract_youtube_video_id(url: str):
 
     return None
 
+
 # ============================================================
 # PUBLIC PAGE HTTP
 # ============================================================
@@ -698,6 +736,7 @@ TRACKER_HEADERS = {
         "*/*;q=0.8"
     ),
 }
+
 
 async def fetch_page_html(url: str):
 
@@ -744,15 +783,6 @@ async def fetch_page_html(url: str):
 
 async def resolve_final_url(url: str):
 
-    """
-    Follows redirects so shortened TikTok share URLs such as:
-
-        https://vm.tiktok.com/...
-        https://vt.tiktok.com/...
-
-    can become the actual video URL.
-    """
-
     timeout = aiohttp.ClientTimeout(
         total=15
     )
@@ -788,6 +818,7 @@ async def resolve_final_url(url: str):
         )
 
         return url
+
 
 # ============================================================
 # NUMBER PARSING
@@ -877,325 +908,6 @@ def find_metric(html, names):
 
     return None
 
-# ============================================================
-# ACCOUNT IDENTITY HELPERS
-# ============================================================
-
-def clean_username(value):
-
-    if not value:
-        return None
-
-    value = unquote(
-        str(value)
-    ).strip()
-
-    value = value.lstrip("@").strip()
-
-    # Remove trailing URL fragments/query if present.
-    value = value.split("?")[0]
-    value = value.split("#")[0]
-    value = value.strip("/")
-
-    return value.lower()
-
-
-def extract_profile_identity_from_url(
-    platform,
-    profile_url
-):
-
-    try:
-
-        parsed = urlparse(profile_url)
-
-        path = unquote(
-            parsed.path
-        ).strip("/")
-
-        if not path:
-            return None
-
-        parts = [
-            p for p in path.split("/")
-            if p
-        ]
-
-        if platform == "TikTok":
-
-            if parts:
-
-                # Normal TikTok profile:
-                # /@username
-                if parts[0].startswith("@"):
-
-                    return clean_username(
-                        parts[0]
-                    )
-
-                # Also tolerate a profile URL without @.
-                return clean_username(
-                    parts[0]
-                )
-
-        if platform == "Instagram":
-
-            if parts:
-
-                return clean_username(
-                    parts[0]
-                )
-
-        if platform == "YouTube":
-
-            if parts:
-
-                # /@handle
-                if parts[0].startswith("@"):
-
-                    return clean_username(
-                        parts[0]
-                    )
-
-                # /channel/CHANNEL_ID
-                if (
-                    parts[0].lower() == "channel"
-                    and len(parts) >= 2
-                ):
-
-                    return clean_username(
-                        parts[1]
-                    )
-
-                # /user/USERNAME
-                if (
-                    parts[0].lower() == "user"
-                    and len(parts) >= 2
-                ):
-
-                    return clean_username(
-                        parts[1]
-                    )
-
-                # /c/CHANNEL
-                if (
-                    parts[0].lower() == "c"
-                    and len(parts) >= 2
-                ):
-
-                    return clean_username(
-                        parts[1]
-                    )
-
-    except Exception:
-        pass
-
-    return None
-
-
-def extract_clip_identity_from_url(
-    platform,
-    clip_url,
-    html=None
-):
-
-    try:
-
-        parsed = urlparse(clip_url)
-
-        path = unquote(
-            parsed.path
-        ).strip("/")
-
-        parts = [
-            p for p in path.split("/")
-            if p
-        ]
-
-        # --------------------------------------------------------
-        # TikTok
-        #
-        # Typical:
-        # https://www.tiktok.com/@username/video/123
-        # --------------------------------------------------------
-
-        if platform == "TikTok":
-
-            for part in parts:
-
-                if part.startswith("@"):
-
-                    return clean_username(
-                        part
-                    )
-
-        # --------------------------------------------------------
-        # Instagram
-        #
-        # Typical:
-        # https://www.instagram.com/username/reel/123
-        # https://www.instagram.com/username/p/123
-        # --------------------------------------------------------
-
-        if platform == "Instagram":
-
-            if parts:
-
-                reserved = {
-                    "reel",
-                    "reels",
-                    "p",
-                    "tv",
-                    "stories",
-                    "explore"
-                }
-
-                if (
-                    parts[0].lower()
-                    not in reserved
-                ):
-
-                    return clean_username(
-                        parts[0]
-                    )
-
-        # --------------------------------------------------------
-        # YouTube
-        # --------------------------------------------------------
-
-        if platform == "YouTube" and html:
-
-            patterns = [
-
-                r'"canonicalBaseUrl"\s*:\s*"(/@[^"]+)"',
-
-                r'"canonicalBaseUrl"\s*:\s*"(/channel/[^"]+)"',
-
-                r'"channelId"\s*:\s*"([^"]+)"',
-
-                r'"externalId"\s*:\s*"([^"]+)"',
-            ]
-
-            for pattern in patterns:
-
-                match = re.search(
-                    pattern,
-                    html,
-                    re.IGNORECASE
-                )
-
-                if match:
-
-                    value = (
-                        match.group(1)
-                        .strip()
-                    )
-
-                    if value.startswith("/@"):
-
-                        return clean_username(
-                            value.split("/", 2)[-1]
-                        )
-
-                    if value.startswith("/channel/"):
-
-                        return clean_username(
-                            value.split("/", 2)[-1]
-                        )
-
-                    return clean_username(
-                        value
-                    )
-
-    except Exception:
-        pass
-
-    return None
-
-# ============================================================
-# TIKTOK CREATOR EXTRACTION FROM HTML
-# ============================================================
-
-def extract_tiktok_author_from_html(html):
-
-    """
-    TikTok share URLs often do not contain the creator username.
-
-    This function looks inside TikTok's page data for the actual
-    creator/author username.
-    """
-
-    if not html:
-        return None
-
-    # First prioritize patterns that specifically associate
-    # uniqueId with an author object.
-    patterns = [
-
-        # Author object containing uniqueId.
-        r'"author"\s*:\s*\{[^{}]{0,2000}?"uniqueId"\s*:\s*"([^"]+)"',
-
-        # Author object containing unique_id.
-        r'"author"\s*:\s*\{[^{}]{0,2000}?"unique_id"\s*:\s*"([^"]+)"',
-
-        # Author object represented directly as a username.
-        r'"author"\s*:\s*"([^"]+)"',
-
-        # TikTok creator information.
-        r'"authorUniqueId"\s*:\s*"([^"]+)"',
-
-        r'"author_unique_id"\s*:\s*"([^"]+)"',
-
-        # Common TikTok page data.
-        r'"uniqueId"\s*:\s*"([^"]+)"',
-
-        r'"unique_id"\s*:\s*"([^"]+)"',
-    ]
-
-    for pattern in patterns:
-
-        matches = re.finditer(
-            pattern,
-            html,
-            re.IGNORECASE | re.DOTALL
-        )
-
-        for match in matches:
-
-            candidate = clean_username(
-                match.group(1)
-            )
-
-            if not candidate:
-                continue
-
-            # Avoid obvious generic values.
-            if candidate in {
-                "tiktok",
-                "video",
-                "user",
-                "author",
-                "undefined",
-                "null",
-            }:
-                continue
-
-            return candidate
-
-    # Last fallback: find a TikTok video URL containing @username.
-    match = re.search(
-        r'tiktok\.com/@([^/"?]+)/video/',
-        html,
-        re.IGNORECASE
-    )
-
-    if match:
-
-        return clean_username(
-            match.group(1)
-        )
-
-    return None
 
 # ============================================================
 # VERIFIED ACCOUNTS
@@ -1223,211 +935,6 @@ async def get_verified_accounts(user_id):
 
             return await cursor.fetchall()
 
-# ============================================================
-# CHECK CLIP OWNERSHIP
-# ============================================================
-
-async def clip_belongs_to_linked_account(
-    user_id,
-    clip_url,
-    platform
-):
-
-    """
-    Verify that the submitted clip was posted by one of the
-    user's verified accounts.
-
-    TikTok is handled specially because share/shortened URLs
-    frequently hide the @username.
-    """
-
-    accounts = await get_verified_accounts(
-        user_id
-    )
-
-    if not accounts:
-
-        return False, "no_account"
-
-    # Only accounts from the same platform matter.
-    platform_accounts = [
-        account
-        for account in accounts
-        if account[1] == platform
-    ]
-
-    if not platform_accounts:
-
-        return False, "not_linked"
-
-    account_identities = set()
-
-    for (
-        account_id,
-        account_platform,
-        profile_url
-    ) in platform_accounts:
-
-        identity = extract_profile_identity_from_url(
-            platform,
-            profile_url
-        )
-
-        if identity:
-
-            account_identities.add(
-                identity
-            )
-
-    print(
-        f"[VERIFY] Linked {platform} identities: "
-        f"{account_identities}"
-    )
-
-    if not account_identities:
-
-        return False, "identity_unknown"
-
-    # ========================================================
-    # TIKTOK
-    # ========================================================
-
-    if platform == "TikTok":
-
-        # Step 1:
-        # Resolve vm.tiktok.com / vt.tiktok.com / other
-        # TikTok share URLs to the actual video URL.
-        resolved_url = await resolve_final_url(
-            clip_url
-        )
-
-        # Step 2:
-        # Try to get @username directly from final URL.
-        clip_identity = extract_clip_identity_from_url(
-            platform,
-            resolved_url
-        )
-
-        print(
-            f"[VERIFY] TikTok URL identity: "
-            f"{clip_identity}"
-        )
-
-        # If the final URL clearly identifies the same account,
-        # accept it immediately.
-        if (
-            clip_identity
-            and
-            clip_identity in account_identities
-        ):
-
-            print(
-                "[VERIFY] TikTok matched from URL."
-            )
-
-            return True, "matched"
-
-        # Step 3:
-        # If the URL doesn't expose the creator, fetch the actual
-        # TikTok video page and inspect its page data.
-        html = await fetch_page_html(
-            resolved_url
-        )
-
-        html_identity = (
-            extract_tiktok_author_from_html(
-                html
-            )
-        )
-
-        print(
-            f"[VERIFY] TikTok HTML identity: "
-            f"{html_identity}"
-        )
-
-        if (
-            html_identity
-            and
-            html_identity in account_identities
-        ):
-
-            print(
-                "[VERIFY] TikTok matched from page HTML."
-            )
-
-            return True, "matched"
-
-        # Step 4:
-        # If both URL and HTML failed to identify the creator,
-        # don't falsely reject it as another person's account.
-        if (
-            not clip_identity
-            and
-            not html_identity
-        ):
-
-            return False, "identity_unknown"
-
-        return False, "not_linked"
-
-    # ========================================================
-    # INSTAGRAM
-    # ========================================================
-
-    if platform == "Instagram":
-
-        clip_identity = extract_clip_identity_from_url(
-            platform,
-            clip_url
-        )
-
-        if not clip_identity:
-
-            return False, "identity_unknown"
-
-        print(
-            f"[VERIFY] Instagram identity: "
-            f"{clip_identity}"
-        )
-
-        if clip_identity in account_identities:
-
-            return True, "matched"
-
-        return False, "not_linked"
-
-    # ========================================================
-    # YOUTUBE
-    # ========================================================
-
-    if platform == "YouTube":
-
-        html = await fetch_page_html(
-            clip_url
-        )
-
-        clip_identity = extract_clip_identity_from_url(
-            platform,
-            clip_url,
-            html
-        )
-
-        if not clip_identity:
-
-            return False, "identity_unknown"
-
-        print(
-            f"[VERIFY] YouTube identity: "
-            f"{clip_identity}"
-        )
-
-        if clip_identity in account_identities:
-
-            return True, "matched"
-
-        return False, "not_linked"
-
-    return False, "identity_unknown"
 
 # ============================================================
 # TIKTOK TRACKING
@@ -1435,7 +942,6 @@ async def clip_belongs_to_linked_account(
 
 async def fetch_tiktok_stats(url: str):
 
-    # Resolve shortened URLs first.
     resolved_url = await resolve_final_url(
         url
     )
@@ -1507,6 +1013,7 @@ async def fetch_tiktok_stats(url: str):
         "likes": likes or 0,
     }
 
+
 # ============================================================
 # INSTAGRAM TRACKING
 # ============================================================
@@ -1576,6 +1083,7 @@ async def fetch_instagram_stats(url: str):
         "views": views or 0,
         "likes": likes or 0,
     }
+
 
 # ============================================================
 # YOUTUBE TRACKING
@@ -1729,6 +1237,7 @@ async def fetch_youtube_stats(url: str):
         "likes": likes or 0,
     }
 
+
 # ============================================================
 # UNIVERSAL VIDEO TRACKER
 # ============================================================
@@ -1780,6 +1289,7 @@ async def fetch_video_stats(url: str):
         )
 
     return None
+
 
 # ============================================================
 # UPDATE ONE SUBMISSION
@@ -1856,6 +1366,7 @@ async def update_submission_stats(
 
     return True
 
+
 # ============================================================
 # BACKGROUND LIVE TRACKER
 # ============================================================
@@ -1910,6 +1421,7 @@ async def track_pending_clips():
 async def before_track_pending_clips():
 
     await bot.wait_until_ready()
+
 
 # ============================================================
 # SOCIAL VERIFICATION
@@ -1967,6 +1479,7 @@ async def check_profile_for_code(
         )
 
         return False
+
 
 # ============================================================
 # ACCOUNT LINK MODAL
@@ -2087,6 +1600,7 @@ class ProfileURLModal(Modal):
             f"the code is found.",
             ephemeral=True
         )
+
 
 # ============================================================
 # ACCOUNT VIEW
@@ -2234,34 +1748,24 @@ class AccountView(View):
 
         if verified:
 
-            await interaction.followup.send(
+            await send_temporary_message(
+                interaction,
                 f"✅ Successfully verified: "
-                f"**{', '.join(verified)}**",
-                ephemeral=True
+                f"**{', '.join(verified)}**"
             )
 
         else:
 
-            message = await interaction.followup.send(
+            await send_temporary_message(
+                interaction,
                 "❌ I couldn't find the verification code yet.\n\n"
                 "Make sure:\n"
                 "• The code is exact\n"
                 "• It is publicly visible\n"
                 "• The profile URL is correct\n"
                 "• The account is publicly accessible\n\n"
-                "Then try again.",
-                ephemeral=True,
-                wait=True
+                "Then try again."
             )
-
-            await asyncio.sleep(
-                ERROR_DELETE_DELAY
-            )
-
-            try:
-                await message.delete()
-            except Exception:
-                pass
 
     @button(
         label="Remove Account",
@@ -2340,9 +1844,9 @@ class AccountView(View):
 
                     await db.commit()
 
-                await interaction.response.send_message(
-                    f"🗑️ **{platform}** account removed.",
-                    ephemeral=True
+                await send_temporary_message(
+                    interaction,
+                    f"🗑️ **{platform}** account removed."
                 )
 
             account_button.callback = callback
@@ -2356,6 +1860,7 @@ class AccountView(View):
             view=view,
             ephemeral=True
         )
+
 
 # ============================================================
 # PAYMENT MODAL
@@ -2451,12 +1956,13 @@ class PaymentModal(Modal):
 
             await db.commit()
 
-        await interaction.response.send_message(
+        await send_temporary_message(
+            interaction,
             f"✅ **Payment method saved.**\n\n"
             f"**Method:** {self.method}\n"
-            f"**Details:** `{details}`",
-            ephemeral=True
+            f"**Details:** `{details}`"
         )
+
 
 # ============================================================
 # PAYMENT VIEW
@@ -2550,6 +2056,7 @@ class PaymentView(View):
             PaymentModal("Venmo")
         )
 
+
 # ============================================================
 # DASHBOARD VIEW
 # ============================================================
@@ -2623,6 +2130,7 @@ class DashboardView(View):
             view=self
         )
 
+
 # ============================================================
 # EARNINGS VIEW
 # ============================================================
@@ -2652,9 +2160,9 @@ class EarningsView(View):
 
         if not rows:
 
-            return await interaction.response.send_message(
-                "No payment history yet.",
-                ephemeral=True
+            return await send_temporary_error(
+                interaction,
+                "No payment history yet."
             )
 
         text = "**Payment History**\n\n"
@@ -2676,10 +2184,11 @@ class EarningsView(View):
                 f"🕐 {created_at[:19].replace('T', ' ')} UTC\n\n"
             )
 
-        await interaction.response.send_message(
-            text[:1900],
-            ephemeral=True
+        await send_temporary_message(
+            interaction,
+            text[:1900]
         )
+
 
 # ============================================================
 # USER CLIP PANEL
@@ -2705,6 +2214,16 @@ class ClipPanel(View):
         interaction,
         button
     ):
+
+        # --------------------------------------------------------
+        # USER MUST HAVE AT LEAST ONE VERIFIED ACCOUNT
+        #
+        # IMPORTANT:
+        # There is NO automatic ownership check anymore.
+        #
+        # Moderators will manually review whether the submitted
+        # clip belongs to the linked account.
+        # --------------------------------------------------------
 
         accounts = await get_verified_accounts(
             interaction.user.id
@@ -2747,9 +2266,9 @@ class ClipPanel(View):
 
         except asyncio.TimeoutError:
 
-            return await interaction.followup.send(
-                "⏰ Timed out. Please try again.",
-                ephemeral=True
+            return await send_temporary_error(
+                interaction,
+                "⏰ Timed out. Please try again."
             )
 
         clip_url = (
@@ -2757,16 +2276,19 @@ class ClipPanel(View):
             .strip()
         )
 
+        # Delete user's pasted URL immediately.
+        try:
+
+            await message.delete()
+
+        except Exception:
+            pass
+
         if not re.match(
             r"^https?://",
             clip_url,
             re.IGNORECASE
         ):
-
-            try:
-                await message.delete()
-            except Exception:
-                pass
 
             return await send_temporary_error(
                 interaction,
@@ -2779,11 +2301,6 @@ class ClipPanel(View):
 
         if not platform:
 
-            try:
-                await message.delete()
-            except Exception:
-                pass
-
             return await send_temporary_error(
                 interaction,
                 "❌ I currently support TikTok, Instagram, "
@@ -2791,70 +2308,12 @@ class ClipPanel(View):
             )
 
         # --------------------------------------------------------
-        # ACCOUNT CHECK
+        # NO OWNERSHIP CHECK
         # --------------------------------------------------------
-
-        checking_message = await interaction.followup.send(
-            f"🔎 Checking that this **{platform}** clip "
-            f"belongs to one of your verified linked accounts...",
-            ephemeral=True,
-            wait=True
-        )
-
-        belongs, reason = await clip_belongs_to_linked_account(
-            interaction.user.id,
-            clip_url,
-            platform
-        )
-
-        # Delete checking message after ownership check.
-        try:
-            await checking_message.delete()
-        except Exception:
-            pass
-
-        if not belongs:
-
-            try:
-                await message.delete()
-            except Exception:
-                pass
-
-            if reason == "no_account":
-
-                error_text = (
-                    "❌ **Account Not Linked**\n\n"
-                    "This account cannot be found or is not "
-                    "linked to the system.\n\n"
-                    "Please link and verify your account, "
-                    "then submit again."
-                )
-
-            elif reason == "identity_unknown":
-
-                error_text = (
-                    "❌ **Account Could Not Be Verified**\n\n"
-                    "I couldn't determine which account posted "
-                    "this clip.\n\n"
-                    "If you're using TikTok, try submitting the "
-                    "normal video/share link again and make sure "
-                    "the video is public."
-                )
-
-            else:
-
-                error_text = (
-                    "❌ **Account Not Linked**\n\n"
-                    "This clip appears to be from an account that "
-                    "is not linked and verified with the bot.\n\n"
-                    "Please link and verify that account, "
-                    "then submit again."
-                )
-
-            return await send_temporary_error(
-                interaction,
-                error_text
-            )
+        #
+        # The bot now accepts the clip after the user has a
+        # verified account. Moderators manually review ownership.
+        # --------------------------------------------------------
 
         # --------------------------------------------------------
         # FIRST STAT CHECK
@@ -2872,7 +2331,9 @@ class ClipPanel(View):
         )
 
         try:
+
             await stats_message.delete()
+
         except Exception:
             pass
 
@@ -2935,7 +2396,8 @@ class ClipPanel(View):
                 initial_views
             )
 
-            await interaction.followup.send(
+            await send_temporary_message(
+                interaction,
                 f"✅ **Clip submitted successfully!**\n\n"
                 f"🆔 Submission: **#{submission_id}**\n"
                 f"📱 Platform: **{platform}**\n"
@@ -2943,30 +2405,23 @@ class ClipPanel(View):
                 f"❤️ Current likes: **{initial_likes:,}**\n"
                 f"💰 Current estimated earnings: "
                 f"**${estimated:.2f}**\n\n"
-                f"🔄 Your pending clip will be checked "
-                f"automatically for updated stats.",
-                ephemeral=True
+                f"👨‍💻 A moderator will manually review your clip.\n"
+                f"🔄 Your pending clip will also be checked "
+                f"automatically for updated stats."
             )
 
         else:
 
-            await interaction.followup.send(
+            await send_temporary_message(
+                interaction,
                 f"✅ **Clip submitted successfully!**\n\n"
                 f"🆔 Submission: **#{submission_id}**\n"
                 f"📱 Platform: **{platform}**\n\n"
+                f"👨‍💻 A moderator will manually review your clip.\n\n"
                 f"⚠️ I couldn't read the current public "
                 f"views/likes yet. The tracker will try again "
-                f"automatically.",
-                ephemeral=True
+                f"automatically."
             )
-
-        try:
-
-            await message.delete()
-
-        except Exception:
-
-            pass
 
     @button(
         label="Accounts",
@@ -3170,9 +2625,9 @@ class ClipPanel(View):
         button
     ):
 
-        await interaction.response.send_message(
-            f"Hello {interaction.user.mention}! 👋",
-            ephemeral=True
+        await send_temporary_message(
+            interaction,
+            f"Hello {interaction.user.mention}! 👋"
         )
 
     @button(
@@ -3214,9 +2669,9 @@ class ClipPanel(View):
 
         if not rows:
 
-            return await interaction.response.send_message(
-                "You have no submissions yet.",
-                ephemeral=True
+            return await send_temporary_error(
+                interaction,
+                "You have no submissions yet."
             )
 
         text = "**Your Recent Submissions**\n\n"
@@ -3259,9 +2714,9 @@ class ClipPanel(View):
                 f"\n🔗 `{url[:50]}`\n\n"
             )
 
-        await interaction.response.send_message(
-            text[:1900],
-            ephemeral=True
+        await send_temporary_message(
+            interaction,
+            text[:1900]
         )
 
     @button(
@@ -3303,6 +2758,7 @@ class ClipPanel(View):
             view=PaymentView(),
             ephemeral=True
         )
+
 
 # ============================================================
 # ADMIN MODALS
@@ -3375,9 +2831,6 @@ class UserIDModal(Modal):
     def __init__(self, action):
 
         titles = {
-            "pending_payouts":
-                "Pending Payout User",
-
             "approved_clips":
                 "Approved Clips",
 
@@ -3471,6 +2924,7 @@ class UserIDModal(Modal):
                 user_id
             )
 
+
 # ============================================================
 # ADMIN OPERATIONS
 # ============================================================
@@ -3522,7 +2976,8 @@ async def approve_submission(
             "❌ This submission has already been handled."
         )
 
-    # One final live check.
+    # Final live stats check only.
+    # NO automatic ownership check.
     fresh_stats = await fetch_video_stats(
         clip_url
     )
@@ -3622,15 +3077,15 @@ async def approve_submission(
 
         await db.commit()
 
-    await interaction.response.send_message(
+    await send_temporary_message(
+        interaction,
         f"✅ **Submission #{submission_id} approved!**\n\n"
         f"👤 User ID: `{user_id}`\n"
         f"👁️ Views: **{views:,}**\n"
         f"❤️ Likes: **{likes:,}**\n"
         f"💰 Added to payout: **${earnings:.2f}**\n\n"
         f"📅 This amount will remain pending until "
-        f"the user's payout is processed.",
-        ephemeral=True
+        f"the user's payout is processed."
     )
 
 
@@ -3679,10 +3134,11 @@ async def reject_submission(
 
         await db.commit()
 
-    await interaction.response.send_message(
-        f"❌ Submission **#{submission_id}** rejected.",
-        ephemeral=True
+    await send_temporary_message(
+        interaction,
+        f"❌ Submission **#{submission_id}** rejected."
     )
+
 
 # ============================================================
 # APPROVED CLIPS / USER PAYOUT VIEW
@@ -3793,10 +3249,11 @@ async def show_approved_clips(
         text="These are clips awaiting the next payout."
     )
 
-    await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True
+    await send_temporary_message(
+        interaction,
+        embed=embed
     )
+
 
 # ============================================================
 # PENDING PAYOUTS
@@ -3810,10 +3267,10 @@ async def show_pending_payouts(
 
     if not rows:
 
-        return await interaction.response.send_message(
+        return await send_temporary_message(
+            interaction,
             "✅ **No Pending Payouts**\n\n"
-            "Everyone with approved earnings has been paid.",
-            ephemeral=True
+            "Everyone with approved earnings has been paid."
         )
 
     embed = discord.Embed(
@@ -3861,10 +3318,11 @@ async def show_pending_payouts(
         text="After Mark Paid, the user automatically disappears from this list."
     )
 
-    await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True
+    await send_temporary_message(
+        interaction,
+        embed=embed
     )
+
 
 # ============================================================
 # ALL USERS
@@ -3893,9 +3351,9 @@ async def show_all_users(
 
     if not rows:
 
-        return await interaction.response.send_message(
-            "No users have submitted clips yet.",
-            ephemeral=True
+        return await send_temporary_error(
+            interaction,
+            "No users have submitted clips yet."
         )
 
     embed = discord.Embed(
@@ -3940,10 +3398,11 @@ async def show_all_users(
             )
         )
 
-    await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True
+    await send_temporary_message(
+        interaction,
+        embed=embed
     )
+
 
 # ============================================================
 # MARK USER PAID
@@ -4043,7 +3502,8 @@ async def mark_user_paid(
             "⚠️ No payment method saved."
         )
 
-    await interaction.response.send_message(
+    await send_temporary_message(
+        interaction,
         f"✅ **User payment marked as paid.**\n\n"
         f"👤 User ID: `{user_id}`\n"
         f"📋 Clips paid: **{clip_count}**\n"
@@ -4052,9 +3512,9 @@ async def mark_user_paid(
         f"**Payment Information**\n"
         f"{payment_text}\n\n"
         f"✅ This user has now been removed automatically "
-        f"from **Pending Payouts**.",
-        ephemeral=True
+        f"from **Pending Payouts**."
     )
+
 
 # ============================================================
 # PAYMENT FAILED / REJECTED
@@ -4094,14 +3554,15 @@ async def process_payment_status(
         else "🚫"
     )
 
-    await interaction.response.send_message(
+    await send_temporary_message(
+        interaction,
         f"{icon} **Payment marked as {status}.**\n\n"
         f"👤 User ID: `{user_id}`\n"
         f"💰 Amount: **${amount:.2f}**\n\n"
         f"⚠️ The user's clips remain unpaid and "
-        f"will stay in **Pending Payouts**.",
-        ephemeral=True
+        f"will stay in **Pending Payouts**."
     )
+
 
 # ============================================================
 # VIEW USER PAYMENT
@@ -4127,16 +3588,17 @@ async def show_user_payment(
         user_id
     )
 
-    await interaction.response.send_message(
+    await send_temporary_message(
+        interaction,
         f"**Payment Information**\n\n"
         f"👤 User ID: `{user_id}`\n"
         f"👤 User: <@{user_id}>\n"
         f"💳 Method: **{payment[0]}**\n"
         f"📌 Details: `{payment[1]}`\n\n"
         f"⏳ Current balance: **${user['pending']:.2f}**\n"
-        f"✅ Total paid historically: **${user['total_paid']:.2f}**",
-        ephemeral=True
+        f"✅ Total paid historically: **${user['total_paid']:.2f}**"
     )
+
 
 # ============================================================
 # ADMIN VIEW
@@ -4146,6 +3608,8 @@ class AdminView(View):
 
     def __init__(self):
 
+        # IMPORTANT:
+        # timeout=None makes the view persistent.
         super().__init__(
             timeout=None
         )
@@ -4187,9 +3651,9 @@ class AdminView(View):
 
         if not rows:
 
-            return await interaction.response.send_message(
-                "No pending clips.",
-                ephemeral=True
+            return await send_temporary_error(
+                interaction,
+                "No pending clips."
             )
 
         embed = discord.Embed(
@@ -4233,9 +3697,9 @@ class AdminView(View):
                 inline=False
             )
 
-        await interaction.response.send_message(
-            embed=embed,
-            ephemeral=True
+        await send_temporary_message(
+            interaction,
+            embed=embed
         )
 
     @button(
@@ -4391,6 +3855,7 @@ class AdminView(View):
             UserIDModal("view_payment")
         )
 
+
 # ============================================================
 # COMMANDS
 # ============================================================
@@ -4423,6 +3888,7 @@ async def setup_clips(
         color=0x2B2D31
     )
 
+    # PUBLIC + PERMANENT USER PANEL
     await interaction.response.send_message(
         embed=embed,
         view=ClipPanel()
@@ -4449,16 +3915,22 @@ async def admin_panel(
             "👥 All Users → find creator Discord IDs\n"
             "📊 Approved Clips → review unpaid creator earnings\n"
             "💰 Pending Payouts → see everyone waiting for payment\n"
-            "💸 Mark Paid → clear a creator's current payout"
+            "💸 Mark Paid → clear a creator's current payout\n\n"
+            "👨‍💻 **Clip ownership is manually reviewed by moderators.**"
         ),
         color=discord.Color.dark_grey()
     )
 
+    # IMPORTANT:
+    # DO NOT use ephemeral=True here.
+    #
+    # Ephemeral admin panels are temporary and can disappear.
+    # This sends a normal channel message with a persistent View.
     await interaction.response.send_message(
         embed=embed,
-        view=AdminView(),
-        ephemeral=True
+        view=AdminView()
     )
+
 
 # ============================================================
 # COMMAND ERROR HANDLER
@@ -4496,6 +3968,7 @@ async def on_app_command_error(
         message
     )
 
+
 # ============================================================
 # READY
 # ============================================================
@@ -4509,17 +3982,26 @@ async def on_ready():
 
     await init_db()
 
-    # Persistent user panel.
+    # --------------------------------------------------------
+    # PERSISTENT USER PANEL
+    # --------------------------------------------------------
+
     bot.add_view(
         ClipPanel()
     )
 
-    # Persistent admin panel.
+    # --------------------------------------------------------
+    # PERSISTENT ADMIN PANEL
+    # --------------------------------------------------------
+
     bot.add_view(
         AdminView()
     )
 
-    # Start tracker only once.
+    # --------------------------------------------------------
+    # START TRACKER ONLY ONCE
+    # --------------------------------------------------------
+
     if not track_pending_clips.is_running():
 
         track_pending_clips.start()
@@ -4542,6 +4024,7 @@ async def on_ready():
             f"Command sync error: {e}"
         )
 
+
 # ============================================================
 # START BOT
 # ============================================================
@@ -4551,5 +4034,6 @@ if not TOKEN:
     raise RuntimeError(
         "TOKEN environment variable is missing."
     )
+
 
 bot.run(TOKEN)
