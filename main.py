@@ -4,7 +4,7 @@ import os
 import random
 import re
 import string
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, urlencode
 
 import aiohttp
 import aiosqlite
@@ -31,8 +31,9 @@ CPM_RATE = 0.60
 # Check pending clips every 5 minutes.
 TRACKER_INTERVAL = 300
 
-# User-facing result/error messages disappear automatically.
-RESULT_DELETE_DELAY = 1
+# Short-lived user feedback only.
+# Persistent panels/history/admin messages never use this.
+RESULT_DELETE_DELAY = 4
 
 
 intents = discord.Intents.default()
@@ -45,7 +46,7 @@ bot = commands.Bot(
 
 
 # ============================================================
-# TEMPORARY RESULT / ERROR HELPER
+# TEMPORARY USER RESULT / ERROR HELPER
 # ============================================================
 
 async def send_temporary_message(
@@ -56,11 +57,23 @@ async def send_temporary_message(
     delay: float = RESULT_DELETE_DELAY
 ):
     """
-    Send an ephemeral result/error message and automatically
-    delete it shortly afterward.
+    Send a short-lived ephemeral user message and automatically
+    delete it after the configured delay.
 
-    This is intended for temporary interaction feedback.
-    It must NOT be used for permanent panels.
+    Use this ONLY for temporary user feedback such as:
+    - success confirmations
+    - errors
+    - short greetings
+    - verification results
+
+    Do NOT use this for:
+    - Submission History
+    - Payment History
+    - Dashboard
+    - Accounts
+    - Earnings
+    - Payment panels
+    - Admin panel results
     """
 
     try:
@@ -117,6 +130,47 @@ async def send_temporary_error(
 
 
 # ============================================================
+# PERSISTENT ADMIN MESSAGE HELPER
+# ============================================================
+
+async def send_admin_message(
+    interaction: discord.Interaction,
+    content: str = None,
+    *,
+    embed=None
+):
+    """
+    Send a persistent admin-panel message.
+
+    Admin messages NEVER auto-delete.
+    """
+
+    try:
+
+        if interaction.response.is_done():
+
+            await interaction.followup.send(
+                content,
+                embed=embed,
+                ephemeral=True
+            )
+
+        else:
+
+            await interaction.response.send_message(
+                content,
+                embed=embed,
+                ephemeral=True
+            )
+
+    except Exception as e:
+
+        print(
+            f"[ADMIN MESSAGE] Could not send message: {e}"
+        )
+
+
+# ============================================================
 # DATABASE
 # ============================================================
 
@@ -138,6 +192,7 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
                 clip_url TEXT,
+                normalized_url TEXT,
                 submitted_at TEXT,
                 status TEXT DEFAULT 'pending',
                 earnings REAL DEFAULT 0,
@@ -213,6 +268,15 @@ async def init_db():
         except Exception:
             pass
 
+        try:
+
+            await db.execute(
+                "ALTER TABLE submissions ADD COLUMN normalized_url TEXT"
+            )
+
+        except Exception:
+            pass
+
         await db.execute("""
             UPDATE submissions
             SET payout_status = 'unpaid'
@@ -221,6 +285,58 @@ async def init_db():
                 payout_status IS NULL
                 OR payout_status = ''
             )
+        """)
+
+        # --------------------------------------------------------
+        # BACKFILL NORMALIZED URLS FOR OLD SUBMISSIONS
+        # --------------------------------------------------------
+
+        async with db.execute(
+            """
+            SELECT id, clip_url
+            FROM submissions
+            WHERE normalized_url IS NULL
+            OR normalized_url = ''
+            """
+        ) as cursor:
+
+            old_rows = await cursor.fetchall()
+
+        for submission_id, clip_url in old_rows:
+
+            if not clip_url:
+                continue
+
+            normalized = normalize_clip_url(
+                clip_url
+            )
+
+            if normalized:
+
+                await db.execute(
+                    """
+                    UPDATE submissions
+                    SET normalized_url = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        normalized,
+                        submission_id
+                    )
+                )
+
+        # --------------------------------------------------------
+        # NORMAL INDEX
+        #
+        # This intentionally is NOT a UNIQUE index because old
+        # databases may already contain duplicate submissions.
+        # The bot performs the duplicate check itself.
+        # --------------------------------------------------------
+
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS
+            idx_submissions_normalized_url
+            ON submissions(normalized_url)
         """)
 
         await db.commit()
@@ -664,6 +780,358 @@ def detect_platform_from_url(url: str):
         pass
 
     return None
+
+
+# ============================================================
+# DUPLICATE SUBMISSION HELPERS
+# ============================================================
+
+def normalize_clip_url(url: str):
+
+    """
+    Convert different versions of the same social-media
+    video URL into a consistent value for duplicate checking.
+
+    Examples:
+
+    YouTube:
+        youtube.com/watch?v=ABC
+        youtube.com/watch?v=ABC&utm_source=x
+        youtu.be/ABC
+
+    All become:
+        youtube:ABC
+
+    Instagram:
+        instagram.com/reel/ABC/
+        instagram.com/reel/ABC/?utm_source=x
+
+    Become:
+        instagram:reel:ABC
+
+    TikTok:
+        tracking parameters are removed and the canonical
+        TikTok path is preserved.
+    """
+
+    if not url:
+
+        return None
+
+    try:
+
+        url = unquote(
+            url.strip()
+        )
+
+        parsed = urlparse(url)
+
+        host = (
+            parsed.netloc
+            .lower()
+            .split(":")[0]
+        )
+
+        path = parsed.path or ""
+
+        path = re.sub(
+            r"/+",
+            "/",
+            path
+        )
+
+        path = path.rstrip("/")
+
+        # ----------------------------------------------------
+        # YOUTUBE
+        # ----------------------------------------------------
+
+        if (
+            host == "youtu.be"
+            or host == "youtube.com"
+            or host.endswith(".youtube.com")
+        ):
+
+            video_id = extract_youtube_video_id(
+                url
+            )
+
+            if video_id:
+
+                return (
+                    "youtube:"
+                    + video_id.strip()
+                )
+
+        # ----------------------------------------------------
+        # INSTAGRAM
+        # ----------------------------------------------------
+
+        if (
+            host == "instagram.com"
+            or host.endswith(".instagram.com")
+        ):
+
+            parts = [
+                part
+                for part in path.split("/")
+                if part
+            ]
+
+            if parts:
+
+                first = parts[0].lower()
+
+                if first in (
+                    "reel",
+                    "reels",
+                    "p",
+                    "tv"
+                ) and len(parts) >= 2:
+
+                    content_type = (
+                        "reel"
+                        if first in (
+                            "reel",
+                            "reels"
+                        )
+                        else first
+                    )
+
+                    content_id = parts[1]
+
+                    return (
+                        "instagram:"
+                        f"{content_type}:"
+                        f"{content_id.lower()}"
+                    )
+
+                if len(parts) >= 2:
+
+                    return (
+                        "instagram:"
+                        + "/".join(
+                            part.lower()
+                            for part in parts[:3]
+                        )
+                    )
+
+                return (
+                    "instagram:"
+                    + parts[0].lower()
+                )
+
+        # ----------------------------------------------------
+        # TIKTOK
+        # ----------------------------------------------------
+
+        if (
+            host == "tiktok.com"
+            or host.endswith(".tiktok.com")
+        ):
+
+            clean_parts = [
+                part
+                for part in path.split("/")
+                if part
+            ]
+
+            if clean_parts:
+
+                return (
+                    "tiktok:"
+                    + "/".join(
+                        part.lower()
+                        for part in clean_parts
+                    )
+                )
+
+            return "tiktok:/"
+
+        # ----------------------------------------------------
+        # FALLBACK
+        # ----------------------------------------------------
+
+        tracking_parameters = {
+            "utm_source",
+            "utm_medium",
+            "utm_campaign",
+            "utm_term",
+            "utm_content",
+            "utm_name",
+            "fbclid",
+            "gclid",
+            "dclid",
+            "yclid",
+            "igshid",
+            "si",
+            "feature",
+            "share_id",
+            "share_link_id",
+            "ref",
+            "referrer"
+        }
+
+        query = parse_qs(
+            parsed.query,
+            keep_blank_values=False
+        )
+
+        clean_query = {}
+
+        for key, values in query.items():
+
+            key_lower = key.lower()
+
+            if key_lower in tracking_parameters:
+                continue
+
+            if key_lower.startswith("utm_"):
+                continue
+
+            if values:
+                clean_query[key_lower] = values[0]
+
+        sorted_query = urlencode(
+            sorted(clean_query.items())
+        )
+
+        scheme = (
+            parsed.scheme
+            .lower()
+        )
+
+        normalized_host = host
+
+        normalized = (
+            f"{scheme}://"
+            f"{normalized_host}"
+            f"{path.lower()}"
+        )
+
+        if sorted_query:
+
+            normalized += (
+                "?"
+                + sorted_query
+            )
+
+        return normalized
+
+    except Exception as e:
+
+        print(
+            f"[DUPLICATE] URL normalization error: {e}"
+        )
+
+        return url.strip().lower()
+
+
+async def get_duplicate_submission(
+    normalized_urls
+):
+
+    normalized_urls = [
+        value
+        for value in normalized_urls
+        if value
+    ]
+
+    if not normalized_urls:
+
+        return None
+
+    placeholders = ",".join(
+        "?"
+        for _ in normalized_urls
+    )
+
+    query = f"""
+        SELECT
+            id,
+            user_id,
+            clip_url,
+            status
+        FROM submissions
+        WHERE normalized_url IN ({placeholders})
+        ORDER BY id ASC
+        LIMIT 1
+    """
+
+    async with aiosqlite.connect(
+        DB_PATH
+    ) as db:
+
+        async with db.execute(
+            query,
+            tuple(normalized_urls)
+        ) as cursor:
+
+            return await cursor.fetchone()
+
+
+async def find_duplicate_submission(
+    clip_url: str
+):
+
+    """
+    Check both the original URL and, when possible, the final
+    redirected URL.
+    """
+
+    original_normalized = normalize_clip_url(
+        clip_url
+    )
+
+    urls_to_check = []
+
+    if original_normalized:
+
+        urls_to_check.append(
+            original_normalized
+        )
+
+    final_url = await resolve_final_url(
+        clip_url
+    )
+
+    if final_url:
+
+        final_normalized = normalize_clip_url(
+            final_url
+        )
+
+        if (
+            final_normalized
+            and final_normalized
+            not in urls_to_check
+        ):
+
+            urls_to_check.append(
+                final_normalized
+            )
+
+    duplicate = await get_duplicate_submission(
+        urls_to_check
+    )
+
+    if duplicate:
+
+        return {
+            "id": duplicate[0],
+            "user_id": duplicate[1],
+            "clip_url": duplicate[2],
+            "status": duplicate[3],
+            "normalized_urls": urls_to_check
+        }
+
+    return {
+        "id": None,
+        "user_id": None,
+        "clip_url": None,
+        "status": None,
+        "normalized_urls": urls_to_check
+    }
 
 
 # ============================================================
@@ -2184,9 +2652,10 @@ class EarningsView(View):
                 f"🕐 {created_at[:19].replace('T', ' ')} UTC\n\n"
             )
 
-        await send_temporary_message(
-            interaction,
-            text[:1900]
+        # PERSISTENT — users need time to read their history.
+        await interaction.response.send_message(
+            text[:1900],
+            ephemeral=True
         )
 
 
@@ -2214,16 +2683,6 @@ class ClipPanel(View):
         interaction,
         button
     ):
-
-        # --------------------------------------------------------
-        # USER MUST HAVE AT LEAST ONE VERIFIED ACCOUNT
-        #
-        # IMPORTANT:
-        # There is NO automatic ownership check anymore.
-        #
-        # Moderators will manually review whether the submitted
-        # clip belongs to the linked account.
-        # --------------------------------------------------------
 
         accounts = await get_verified_accounts(
             interaction.user.id
@@ -2276,7 +2735,6 @@ class ClipPanel(View):
             .strip()
         )
 
-        # Delete user's pasted URL immediately.
         try:
 
             await message.delete()
@@ -2308,12 +2766,43 @@ class ClipPanel(View):
             )
 
         # --------------------------------------------------------
-        # NO OWNERSHIP CHECK
+        # GLOBAL DUPLICATE CHECK
         # --------------------------------------------------------
-        #
-        # The bot now accepts the clip after the user has a
-        # verified account. Moderators manually review ownership.
-        # --------------------------------------------------------
+
+        duplicate_info = await find_duplicate_submission(
+            clip_url
+        )
+
+        normalized_urls = duplicate_info.get(
+            "normalized_urls",
+            []
+        )
+
+        if duplicate_info.get("id"):
+
+            duplicate_id = duplicate_info["id"]
+
+            print(
+                f"[DUPLICATE] Submission blocked.\n"
+                f"             New URL: {clip_url}\n"
+                f"             Existing submission: #{duplicate_id}\n"
+                f"             Existing user: {duplicate_info.get('user_id')}"
+            )
+
+            return await send_temporary_error(
+                interaction,
+                "❌ **Duplicate Submission**\n\n"
+                "This video has already been submitted and "
+                "cannot be submitted again."
+            )
+
+        if not normalized_urls:
+
+            return await send_temporary_error(
+                interaction,
+                "❌ I couldn't process this video link. "
+                "Please try again with the original video URL."
+            )
 
         # --------------------------------------------------------
         # FIRST STAT CHECK
@@ -2362,12 +2851,44 @@ class ClipPanel(View):
             DB_PATH
         ) as db:
 
+            placeholders = ",".join(
+                "?"
+                for _ in normalized_urls
+            )
+
+            async with db.execute(
+                f"""
+                SELECT
+                    id,
+                    user_id,
+                    clip_url,
+                    status
+                FROM submissions
+                WHERE normalized_url IN ({placeholders})
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                tuple(normalized_urls)
+            ) as cursor:
+
+                existing = await cursor.fetchone()
+
+            if existing:
+
+                return await send_temporary_error(
+                    interaction,
+                    "❌ **Duplicate Submission**\n\n"
+                    "This video has already been submitted "
+                    "and cannot be submitted again."
+                )
+
             cursor = await db.execute(
                 """
                 INSERT INTO submissions
                 (
                     user_id,
                     clip_url,
+                    normalized_url,
                     submitted_at,
                     status,
                     earnings,
@@ -2375,11 +2896,12 @@ class ClipPanel(View):
                     likes,
                     payout_status
                 )
-                VALUES (?, ?, ?, 'pending', 0, ?, ?, 'unpaid')
+                VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, 'unpaid')
                 """,
                 (
                     interaction.user.id,
                     clip_url,
+                    normalized_urls[0],
                     utc_now(),
                     initial_views,
                     initial_likes
@@ -2714,9 +3236,10 @@ class ClipPanel(View):
                 f"\n🔗 `{url[:50]}`\n\n"
             )
 
-        await send_temporary_message(
-            interaction,
-            text[:1900]
+        # PERSISTENT — users need time to go through submissions.
+        await interaction.response.send_message(
+            text[:1900],
+            ephemeral=True
         )
 
     @button(
@@ -2806,7 +3329,7 @@ class SubmissionIDModal(Modal):
 
         except ValueError:
 
-            return await send_temporary_error(
+            return await send_admin_message(
                 interaction,
                 "❌ Invalid Submission ID."
             )
@@ -2882,7 +3405,7 @@ class UserIDModal(Modal):
 
         except ValueError:
 
-            return await send_temporary_error(
+            return await send_admin_message(
                 interaction,
                 "❌ Invalid Discord User ID."
             )
@@ -2956,7 +3479,7 @@ async def approve_submission(
 
     if not row:
 
-        return await send_temporary_error(
+        return await send_admin_message(
             interaction,
             "❌ Submission not found."
         )
@@ -2971,7 +3494,7 @@ async def approve_submission(
 
     if status != "pending":
 
-        return await send_temporary_error(
+        return await send_admin_message(
             interaction,
             "❌ This submission has already been handled."
         )
@@ -3029,7 +3552,7 @@ async def approve_submission(
 
         if not current or current[0] != "pending":
 
-            return await send_temporary_error(
+            return await send_admin_message(
                 interaction,
                 "❌ This submission was already handled."
             )
@@ -3077,7 +3600,7 @@ async def approve_submission(
 
         await db.commit()
 
-    await send_temporary_message(
+    await send_admin_message(
         interaction,
         f"✅ **Submission #{submission_id} approved!**\n\n"
         f"👤 User ID: `{user_id}`\n"
@@ -3111,14 +3634,14 @@ async def reject_submission(
 
         if not row:
 
-            return await send_temporary_error(
+            return await send_admin_message(
                 interaction,
                 "❌ Submission not found."
             )
 
         if row[0] != "pending":
 
-            return await send_temporary_error(
+            return await send_admin_message(
                 interaction,
                 "❌ Submission already handled."
             )
@@ -3134,7 +3657,7 @@ async def reject_submission(
 
         await db.commit()
 
-    await send_temporary_message(
+    await send_admin_message(
         interaction,
         f"❌ Submission **#{submission_id}** rejected."
     )
@@ -3155,7 +3678,7 @@ async def show_approved_clips(
 
     if not rows:
 
-        return await send_temporary_error(
+        return await send_admin_message(
             interaction,
             f"❌ User `{user_id}` has no unpaid approved clips."
         )
@@ -3249,7 +3772,8 @@ async def show_approved_clips(
         text="These are clips awaiting the next payout."
     )
 
-    await send_temporary_message(
+    # PERSISTENT ADMIN RESULT.
+    await send_admin_message(
         interaction,
         embed=embed
     )
@@ -3267,7 +3791,7 @@ async def show_pending_payouts(
 
     if not rows:
 
-        return await send_temporary_message(
+        return await send_admin_message(
             interaction,
             "✅ **No Pending Payouts**\n\n"
             "Everyone with approved earnings has been paid."
@@ -3318,7 +3842,8 @@ async def show_pending_payouts(
         text="After Mark Paid, the user automatically disappears from this list."
     )
 
-    await send_temporary_message(
+    # PERSISTENT ADMIN RESULT.
+    await send_admin_message(
         interaction,
         embed=embed
     )
@@ -3351,7 +3876,7 @@ async def show_all_users(
 
     if not rows:
 
-        return await send_temporary_error(
+        return await send_admin_message(
             interaction,
             "No users have submitted clips yet."
         )
@@ -3398,7 +3923,8 @@ async def show_all_users(
             )
         )
 
-    await send_temporary_message(
+    # PERSISTENT ADMIN RESULT.
+    await send_admin_message(
         interaction,
         embed=embed
     )
@@ -3419,7 +3945,7 @@ async def mark_user_paid(
 
     if not rows:
 
-        return await send_temporary_error(
+        return await send_admin_message(
             interaction,
             f"❌ User `{user_id}` has no unpaid approved earnings."
         )
@@ -3502,7 +4028,8 @@ async def mark_user_paid(
             "⚠️ No payment method saved."
         )
 
-    await send_temporary_message(
+    # PERSISTENT ADMIN RESULT.
+    await send_admin_message(
         interaction,
         f"✅ **User payment marked as paid.**\n\n"
         f"👤 User ID: `{user_id}`\n"
@@ -3532,7 +4059,7 @@ async def process_payment_status(
 
     if not rows:
 
-        return await send_temporary_error(
+        return await send_admin_message(
             interaction,
             f"❌ User `{user_id}` has no unpaid approved earnings."
         )
@@ -3554,7 +4081,8 @@ async def process_payment_status(
         else "🚫"
     )
 
-    await send_temporary_message(
+    # PERSISTENT ADMIN RESULT.
+    await send_admin_message(
         interaction,
         f"{icon} **Payment marked as {status}.**\n\n"
         f"👤 User ID: `{user_id}`\n"
@@ -3579,7 +4107,7 @@ async def show_user_payment(
 
     if not payment:
 
-        return await send_temporary_error(
+        return await send_admin_message(
             interaction,
             f"❌ User `{user_id}` has no payment method saved."
         )
@@ -3588,7 +4116,8 @@ async def show_user_payment(
         user_id
     )
 
-    await send_temporary_message(
+    # PERSISTENT ADMIN RESULT.
+    await send_admin_message(
         interaction,
         f"**Payment Information**\n\n"
         f"👤 User ID: `{user_id}`\n"
@@ -3608,8 +4137,6 @@ class AdminView(View):
 
     def __init__(self):
 
-        # IMPORTANT:
-        # timeout=None makes the view persistent.
         super().__init__(
             timeout=None
         )
@@ -3651,7 +4178,7 @@ class AdminView(View):
 
         if not rows:
 
-            return await send_temporary_error(
+            return await send_admin_message(
                 interaction,
                 "No pending clips."
             )
@@ -3697,7 +4224,8 @@ class AdminView(View):
                 inline=False
             )
 
-        await send_temporary_message(
+        # PERSISTENT ADMIN RESULT.
+        await send_admin_message(
             interaction,
             embed=embed
         )
@@ -3921,11 +4449,6 @@ async def admin_panel(
         color=discord.Color.dark_grey()
     )
 
-    # IMPORTANT:
-    # DO NOT use ephemeral=True here.
-    #
-    # Ephemeral admin panels are temporary and can disappear.
-    # This sends a normal channel message with a persistent View.
     await interaction.response.send_message(
         embed=embed,
         view=AdminView()
@@ -3963,6 +4486,7 @@ async def on_app_command_error(
             "while running that command."
         )
 
+    # Command-level errors are short-lived user feedback.
     await send_temporary_error(
         interaction,
         message
